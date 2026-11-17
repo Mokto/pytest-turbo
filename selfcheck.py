@@ -185,19 +185,30 @@ with tempfile.TemporaryDirectory() as tmp:
         "    open('other', 'a').write('x')\n"
         "    raise ValueError('flaky')\n\n"
         "def test_slow():\n    time.sleep(5)\n\n"
-        "def test_hangs_in_c():\n    import signal\n    signal.signal(signal.SIGALRM, signal.SIG_IGN)\n    time.sleep(60)\n\n"
+        "def test_crashes_once():\n"
+        "    if not os.path.exists('crashed'):\n        open('crashed', 'w').close()\n        os._exit(1)\n\n"
         "@pytest.mark.timeout(3)\ndef test_marker_allows_more():\n    time.sleep(1.5)\n\n"
         "def test_prints():\n    print('visible with -s')\n"
     )
     env = {**os.environ, "NO_COLOR": "1"}
-    turbo = subprocess.run([TURBO, "-n", "2", "--python", sys.executable], cwd=tmp, capture_output=True, text=True, env=env)
+    Path(tmp, "test_hang.py").write_text(
+        "import signal, time\n\ndef test_hangs_in_c():\n    signal.signal(signal.SIGALRM, signal.SIG_IGN)\n    time.sleep(60)\n\n"
+        "def test_after():\n    pass\n"
+    )
+    turbo = subprocess.run([TURBO, "-n", "2", "--python", sys.executable, "test_x.py"], cwd=tmp, capture_output=True, text=True, env=env)
     out = turbo.stdout
-    assert counts(last_line(out)) == {"passed": 3, "failed": 2, "error": 1}, out
-    assert "test_x.py::test_hangs_in_c (crash" in out and 'test_x.py", line 19 in test_hangs_in_c' in out, out
+    assert counts(last_line(out)) == {"passed": 4, "failed": 2}, out
+    assert "2 flaky" in last_line(out), out
+    assert "test_crashes_once worker" in out and "test_crashes_once passed after 1 rerun(s)" in out, out
     assert "FLAKY" in out and "test_flaky_twice passed after 2 rerun(s)" in out, out
     assert Path(tmp, "tries").read_text() == "xxx" and Path(tmp, "other").read_text() == "x", "rerun counts"
     assert "Timeout (>1.0s) from pytest-turbo" in out, out
     print("reruns and timeout from addopts and ini: ok")
+
+    hang = subprocess.run([TURBO, "--python", sys.executable, "test_hang.py", "--", "--reruns", "0"], cwd=tmp, capture_output=True, text=True, env=env)
+    assert counts(last_line(hang.stdout)) == {"passed": 1, "error": 1}, hang.stdout
+    assert "test_hang.py::test_hangs_in_c (crash" in hang.stdout and 'test_hang.py", line 5 in test_hangs_in_c' in hang.stdout, hang.stdout
+    print("uninterruptible hang: ok")
 
     node = subprocess.run(
         [TURBO, "--python", sys.executable, "test_x.py::test_prints", "--", "-s"], cwd=tmp, capture_output=True, text=True, env=env

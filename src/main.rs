@@ -61,8 +61,8 @@ struct Worker {
     exited: bool,
     /// Told there is no more work: it will not ask again.
     closed: bool,
-    /// The test it is running: node id, index in its file, and where its output starts in the log.
-    running: Option<(String, usize, u64)>,
+    /// The test it is running: node id, index in its file, where its output starts in the log, reruns it has left.
+    running: Option<(String, usize, u64, u64)>,
 }
 
 struct TestResult {
@@ -200,7 +200,8 @@ fn main() -> ExitCode {
                     }
                     "start" => {
                         let offset = fs::metadata(log_path(&logs, wid)).map_or(0, |m| m.len());
-                        w.running = msg["nodeid"].as_str().map(|id| (id.to_string(), msg["index"].as_u64().unwrap_or(0) as usize, offset));
+                        let left = msg["reruns"].as_u64().unwrap_or(0);
+                        w.running = msg["nodeid"].as_str().map(|id| (id.to_string(), msg["index"].as_u64().unwrap_or(0) as usize, offset, left));
                     }
                     "rerun" => {
                         w.running = None;
@@ -238,13 +239,34 @@ fn main() -> ExitCode {
                 let tail: Vec<&str> = log.lines().rev().take(30).collect();
                 let tail = tail.into_iter().rev().collect::<Vec<_>>().join("\n");
                 let mut tasks = std::mem::take(&mut w.inflight);
-                // The test it was running fails, and its file goes on after it on another worker.
-                if let (Some((nodeid, index, offset)), Some(current)) = (w.running.take(), tasks.first().cloned()) {
+                // The test it was running is rerun or fails, and its file goes on after it on another worker.
+                if let (Some((nodeid, index, offset, left)), Some(current)) = (w.running.take(), tasks.first().cloned()) {
                     tasks.remove(0);
                     let since = log.get(offset as usize..).unwrap_or("");
                     let text = format!("worker died running this test\n{}", since.lines().take(60).collect::<Vec<_>>().join("\n"));
-                    say(format!("{} {nodeid} worker {wid} died", style("CRASH").red().bold()));
                     awaiting_rerun.remove(&nodeid);
+                    if current.only.is_none() {
+                        queue.push_front(Task { from: index + 1, ..current.clone() });
+                    }
+                    // A crash has no exception for --only-rerun to match, so any --reruns covers it.
+                    if left > 0 {
+                        say(format!("{} {nodeid} worker {wid} died, rerunning", style("CRASH").yellow().bold()));
+                        let attempt = reruns.entry(nodeid.clone()).or_default();
+                        *attempt += 1;
+                        queue.push_front(Task { path: current.path, cuts: vec![], chunk: 0, estimate: None, only: Some(nodeid.clone()), attempt: *attempt, from: 0 });
+                        awaiting_rerun.insert(nodeid);
+                        queue.extend(tasks.drain(..));
+                        if restarts < MAX_RESTARTS {
+                            restarts += 1;
+                            start_worker(&mut workers);
+                            alive += 1;
+                        } else {
+                            errors.push(("too many worker crashes, stopped".into(), tail));
+                            queue.clear();
+                        }
+                        continue;
+                    }
+                    say(format!("{} {nodeid} worker {wid} died", style("CRASH").red().bold()));
                     let r = TestResult {
                         outcome: "error".into(),
                         duration: 0.0,
@@ -262,8 +284,6 @@ fn main() -> ExitCode {
                         for w in &mut workers {
                             let _ = w.child.kill();
                         }
-                    } else if current.only.is_none() {
-                        queue.push_front(Task { from: index + 1, ..current });
                     }
                     queue.extend(tasks.drain(..)); // fetched ahead, not started
                 }

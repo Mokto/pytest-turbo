@@ -67,7 +67,7 @@ On two real suites, compared with `pytest -n auto --dist loadfile`:
 - Failures appear as they happen. At the end, each failure is printed in full with its captured stdout, stderr and log output.
 - Tests that pass only after a rerun are reported as `FLAKY`.
 - The summary lists the slowest files.
-- When a worker crashes in a test, that test is reported as an error with the worker's output since it started, and a new worker runs the rest of the file. A crash between tests retries the file once.
+- When a worker crashes in a test, a new worker runs the rest of the file. The test is rerun if `--reruns` allows (whatever `--only-rerun` says: a crash has no exception to match), otherwise it is reported as an error with the worker's output since it started. A crash between tests retries the file once.
 - With `-s`, the workers' output goes to the terminal.
 
 ## How it works

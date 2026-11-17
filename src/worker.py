@@ -91,7 +91,8 @@ class TurboWorker:
 
     @pytest.hookimpl(wrapper=True)
     def pytest_runtest_protocol(self, item):
-        self.send(type="start", index=self.where.get(item.nodeid, (None, None))[1], nodeid=item.nodeid)
+        index = self.where.get(item.nodeid, (None, None))[1]
+        self.send(type="start", index=index, nodeid=item.nodeid, reruns=self.reruns - item.turbo_attempt)
         marker = item.get_closest_marker("timeout")
         self.current_timeout = float(marker.args[0]) if marker and marker.args else self.timeout
         if not self.current_timeout:
