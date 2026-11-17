@@ -100,7 +100,7 @@ fn main() -> ExitCode {
     let (tx, rx) = mpsc::channel();
     let mut workers: Vec<Worker> = Vec::new();
     for _ in 0..n {
-        workers.push(spawn(&python, &args.pytest_args, workers.len(), &tx));
+        workers.push(spawn(&python, &args.pytest_args, workers.len(), n, &tx));
     }
 
     let mut queue: VecDeque<Task> = tasks.into();
@@ -201,7 +201,7 @@ fn main() -> ExitCode {
                 }
                 if !queue.is_empty() && restarts < MAX_RESTARTS {
                     restarts += 1;
-                    workers.push(spawn(&python, &args.pytest_args, workers.len(), &tx));
+                    workers.push(spawn(&python, &args.pytest_args, workers.len(), n, &tx));
                     alive += 1;
                 } else if !queue.is_empty() {
                     errors.push(("too many worker crashes, stopped".into(), tail));
@@ -225,11 +225,14 @@ fn main() -> ExitCode {
     ExitCode::from(if results.is_empty() && ok { 5 } else if ok { 0 } else { 1 })
 }
 
-fn spawn(python: &Path, pytest_args: &[String], wid: usize, tx: &mpsc::Sender<Event>) -> Worker {
+fn spawn(python: &Path, pytest_args: &[String], wid: usize, n: usize, tx: &mpsc::Sender<Event>) -> Worker {
     let mut child = Command::new(python)
         .arg("-c")
         .arg(WORKER_PY)
         .args(pytest_args)
+        // Same names as pytest-xdist: suites use them to give each worker its own database.
+        .env("PYTEST_XDIST_WORKER", format!("gw{wid}"))
+        .env("PYTEST_XDIST_WORKER_COUNT", n.to_string())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(File::create(log_path(wid)).expect("worker log"))

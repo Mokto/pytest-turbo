@@ -117,6 +117,7 @@ class TurboWorker:
 
 
 def main():
+    sys.argv[0] = os.path.join(os.path.dirname(sys.executable), "pytest")  # code that checks "am I under pytest" by argv[0]
     events = os.fdopen(os.dup(1), "w", buffering=1)
     inbox = os.fdopen(os.dup(0), "r")
     os.dup2(os.open(os.devnull, os.O_WRONLY), 1)

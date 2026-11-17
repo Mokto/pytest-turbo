@@ -129,3 +129,15 @@ with tempfile.TemporaryDirectory() as tmp:
     turbo = subprocess.run([TURBO, "--python", sys.executable, str(flaky), "--", "--reruns", "1"], cwd=tmp, capture_output=True, text=True, env=env)
     assert turbo.returncode == 0 and "1 passed, 1 flaky" in turbo.stdout, turbo.stdout
     print("flaky: ok")
+
+    env_test = Path(tmp, "test_env.py")
+    env_test.write_text(
+        "import os, sys\n\n"
+        "def test_looks_like_xdist():\n"
+        "    assert os.environ['PYTEST_XDIST_WORKER'].startswith('gw')\n"
+        "    assert os.environ['PYTEST_XDIST_WORKER_COUNT'] == '2'\n"
+        "    assert sys.argv[0].endswith('pytest')\n"
+    )
+    turbo = subprocess.run([TURBO, "-n", "2", "--python", sys.executable, str(env_test), str(flaky)], cwd=tmp, capture_output=True, text=True, env=env)
+    assert turbo.returncode == 0, turbo.stdout
+    print("xdist env: ok")
