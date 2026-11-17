@@ -148,7 +148,8 @@ with tempfile.TemporaryDirectory() as tmp:
 
     turbo = subprocess.run([TURBO, "-x", "-n", "2", "--python", sys.executable], cwd=tmp, capture_output=True, text=True, env=env)
     got = counts(last_line(turbo.stdout))
-    assert turbo.returncode == 1 and got["failed"] == 1 and got.get("passed", 0) < want["passed"], turbo.stdout
+    stops = got.get("failed", 0) + got.get("error", 0)  # the failing test or the crash, whichever comes first
+    assert turbo.returncode == 1 and stops == 1 and got.get("passed", 0) < want["passed"], turbo.stdout
     print(f"-x: ok {got}")
 
     flaky = Path(tmp, "test_flaky.py")
