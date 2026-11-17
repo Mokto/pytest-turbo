@@ -1,7 +1,0 @@
-version = 1
-revision = 5
-requires-python = ">=3.9"
-
-[[package]]
-name = "pytest-turbo"
-source = { editable = "." }
