@@ -1,0 +1,22 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: astral-sh/setup-uv@v6
+      - run: cargo clippy --release -- -D warnings
+      - run: cargo test --release
+      - run: uv run --no-project --with pytest --with pytest-rerunfailures python selfcheck.py

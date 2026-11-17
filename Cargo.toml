@@ -1,0 +1,19 @@
+[package]
+name = "pytest-turbo"
+version = "0.0.1"
+edition = "2024"
+description = "Run your pytest suite in parallel, slowest tests first, in long-lived pytest workers"
+license = "MIT"
+repository = "https://github.com/Mokto/pytest-turbo"
+readme = "README.md"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+console = "0.16"
+globset = "0.4"
+indicatif = "0.18"
+serde_json = "1"
+toml = "0.9"
+
+[profile.release]
+strip = true

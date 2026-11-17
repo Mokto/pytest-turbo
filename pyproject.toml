@@ -1,0 +1,23 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "pytest-turbo"
+dynamic = ["version"]
+description = "Run your pytest suite in parallel, slowest tests first, in long-lived pytest workers"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.9"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Framework :: Pytest",
+    "Programming Language :: Rust",
+    "Topic :: Software Development :: Testing",
+]
+
+[project.urls]
+Repository = "https://github.com/Mokto/pytest-turbo"
+
+[tool.maturin]
+bindings = "bin"
