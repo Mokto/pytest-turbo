@@ -18,8 +18,6 @@ use serde_json::Value;
 use schedule::{Durations, Task};
 
 const WORKER_PY: &str = include_str!("worker.py");
-const CACHE: &str = ".pytest-turbo/durations.json";
-const LOGS: &str = ".pytest-turbo/logs";
 const MAX_RESTARTS: usize = 4;
 
 /// Run pytest test files in parallel, slowest first, in long-lived pytest workers.
@@ -38,6 +36,9 @@ struct Args {
     /// Never split a slow file across workers (each chunk repeats module import and class setup)
     #[arg(long)]
     no_split: bool,
+    /// Where test durations are kept between runs (default: .pytest-turbo/durations.json in the rootdir)
+    #[arg(long)]
+    durations_file: Option<PathBuf>,
     /// Python interpreter (default: $VIRTUAL_ENV, the nearest .venv, the env this binary is installed in, python3)
     #[arg(long)]
     python: Option<PathBuf>,
@@ -81,7 +82,12 @@ fn main() -> ExitCode {
         vec![PathBuf::from(".")]
     };
     let files = config::discover(&roots, &cfg);
-    let known: Durations = fs::read_to_string(CACHE).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+    let state = cfg.rootdir.join(".pytest-turbo");
+    let logs = state.join("logs");
+    fs::create_dir_all(&logs).expect("create .pytest-turbo/logs");
+    let _ = fs::write(state.join(".gitignore"), "*\n");
+    let durations_file = args.durations_file.clone().unwrap_or_else(|| state.join("durations.json"));
+    let known = load_durations(&durations_file, &cfg.rootdir);
     let n = args.workers.unwrap_or_else(|| thread::available_parallelism().map_or(4, |n| n.get()));
     let tasks = schedule::plan(&files, &known, if args.no_split { 0 } else { n });
     let chunks_per_file: HashMap<String, usize> = tasks.iter().map(|t| (t.path.clone(), t.cuts.len() + 1)).collect();
@@ -96,11 +102,10 @@ fn main() -> ExitCode {
     pb.enable_steady_tick(Duration::from_millis(100));
     let say = |s: String| if pb.is_hidden() { println!("{s}") } else { pb.println(s) };
 
-    fs::create_dir_all(LOGS).expect("create .pytest-turbo/logs");
     let (tx, rx) = mpsc::channel();
     let mut workers: Vec<Worker> = Vec::new();
     for _ in 0..n {
-        workers.push(spawn(&python, &args.pytest_args, workers.len(), n, &tx));
+        workers.push(spawn(&python, &args.pytest_args, &logs, workers.len(), n, &tx));
     }
 
     let mut queue: VecDeque<Task> = tasks.into();
@@ -187,7 +192,7 @@ fn main() -> ExitCode {
                 if w.exited || stopping {
                     continue;
                 }
-                let log = fs::read_to_string(log_path(wid)).unwrap_or_default();
+                let log = fs::read_to_string(log_path(&logs, wid)).unwrap_or_default();
                 let tail: Vec<&str> = log.lines().rev().take(30).collect();
                 let tail = tail.into_iter().rev().collect::<Vec<_>>().join("\n");
                 for task in std::mem::take(&mut w.inflight) {
@@ -201,7 +206,7 @@ fn main() -> ExitCode {
                 }
                 if !queue.is_empty() && restarts < MAX_RESTARTS {
                     restarts += 1;
-                    workers.push(spawn(&python, &args.pytest_args, workers.len(), n, &tx));
+                    workers.push(spawn(&python, &args.pytest_args, &logs, workers.len(), n, &tx));
                     alive += 1;
                 } else if !queue.is_empty() {
                     errors.push(("too many worker crashes, stopped".into(), tail));
@@ -218,14 +223,14 @@ fn main() -> ExitCode {
             cache.insert(path, d);
         }
     }
-    let _ = fs::write(CACHE, serde_json::to_string(&cache).unwrap());
+    save_durations(&durations_file, &cfg.rootdir, &cache);
 
     report(&results, &errors, &files, &cache, start, discovery, n, &cwd);
     let ok = errors.is_empty() && failed == 0;
     ExitCode::from(if results.is_empty() && ok { 5 } else if ok { 0 } else { 1 })
 }
 
-fn spawn(python: &Path, pytest_args: &[String], wid: usize, n: usize, tx: &mpsc::Sender<Event>) -> Worker {
+fn spawn(python: &Path, pytest_args: &[String], logs: &Path, wid: usize, n: usize, tx: &mpsc::Sender<Event>) -> Worker {
     let mut child = Command::new(python)
         .arg("-c")
         .arg(WORKER_PY)
@@ -235,7 +240,7 @@ fn spawn(python: &Path, pytest_args: &[String], wid: usize, n: usize, tx: &mpsc:
         .env("PYTEST_XDIST_WORKER_COUNT", n.to_string())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(File::create(log_path(wid)).expect("worker log"))
+        .stderr(File::create(log_path(logs, wid)).expect("worker log"))
         .spawn()
         .unwrap_or_else(|e| panic!("cannot start {}: {e}", python.display()));
     let stdout = child.stdout.take().unwrap();
@@ -252,8 +257,28 @@ fn spawn(python: &Path, pytest_args: &[String], wid: usize, n: usize, tx: &mpsc:
     Worker { child, stdin, inflight: vec![], exited: false }
 }
 
-fn log_path(wid: usize) -> PathBuf {
-    Path::new(LOGS).join(format!("worker-{wid}.log"))
+fn log_path(logs: &Path, wid: usize) -> PathBuf {
+    logs.join(format!("worker-{wid}.log"))
+}
+
+/// Keys are stored relative to the rootdir, so the file stays valid when the checkout moves (CI).
+fn load_durations(file: &Path, rootdir: &Path) -> Durations {
+    let stored: Durations = fs::read_to_string(file).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+    stored.into_iter().map(|(k, v)| (rootdir.join(k).display().to_string(), v)).collect()
+}
+
+/// Written to a temporary file and renamed, so concurrent runs sharing the file never see half of one.
+fn save_durations(file: &Path, rootdir: &Path, cache: &Durations) {
+    let relative: Durations = cache
+        .iter()
+        .map(|(k, v)| (Path::new(k).strip_prefix(rootdir).map_or(k.clone(), |p| p.display().to_string()), v.clone()))
+        .collect();
+    let tmp = file.with_extension(format!("tmp{}", std::process::id()));
+    let written = file.parent().map_or(Ok(()), fs::create_dir_all).and_then(|_| fs::write(&tmp, serde_json::to_string(&relative).unwrap()));
+    if written.and_then(|_| fs::rename(&tmp, file)).is_err() {
+        eprintln!("pytest-turbo: could not write {}", file.display());
+        let _ = fs::remove_file(&tmp);
+    }
 }
 
 fn find_python(cwd: &Path) -> PathBuf {

@@ -117,7 +117,13 @@ with tempfile.TemporaryDirectory() as tmp:
         print(f"-n {workers}: ok {got}")
 
     cache = json.loads(Path(tmp, ".pytest-turbo/durations.json").read_text())
-    assert len(cache[big]) == 40, "split chunks did not report every test of the split file"
+    assert len(cache["test_big.py"]) == 40, "split chunks did not report every test of the split file"
+    assert Path(tmp, ".pytest-turbo/.gitignore").read_text() == "*\n"
+
+    elsewhere = Path(tmp, "elsewhere/durations.json")
+    subprocess.run([TURBO, "--python", sys.executable, "--durations-file", str(elsewhere), "pkg"], cwd=tmp, capture_output=True, env=env)
+    assert set(json.loads(elsewhere.read_text())) == {"pkg/case_test.py"}, elsewhere.read_text()
+    print("durations file: ok")
 
     turbo = subprocess.run([TURBO, "-x", "-n", "2", "--python", sys.executable], cwd=tmp, capture_output=True, text=True, env=env)
     got = counts(last_line(turbo.stdout))

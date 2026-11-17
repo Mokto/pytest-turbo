@@ -21,10 +21,22 @@ pytest-turbo -- -k slow --tb=long  # anything after -- goes to pytest
 
 It runs pytest with the Python of `$VIRTUAL_ENV`, else the nearest `.venv`, else the environment it is installed in. `--python` picks another.
 
+Each worker gets `PYTEST_XDIST_WORKER` (`gw0`, `gw1`, …) and `PYTEST_XDIST_WORKER_COUNT`, as under pytest-xdist, so suites that give each worker its own database keep working.
+
+### In CI
+
+The speedup depends on knowing test durations from earlier runs. On a fresh checkout there are none, so keep the file somewhere that survives between jobs:
+
+```sh
+pytest-turbo --durations-file /persistent/cache/my-suite.json
+```
+
+Paths in it are relative to the pytest rootdir, and it is replaced atomically, so parallel jobs can share it.
+
 ## Why it's faster than xdist
 
 - **Each worker imports only the files it runs.** xdist collects the whole suite in every worker, so every worker pays for importing every test module.
-- **Slowest first.** Durations from earlier runs are kept in `.pytest-turbo/`, and the slowest files go out first, so no worker is left running a long file at the end.
+- **Slowest first.** Durations from earlier runs are kept in `.pytest-turbo/` in the rootdir, and the slowest files go out first, so no worker is left running a long file at the end.
 - **Long files are split.** A file that would take longer than a worker's fair share runs on several workers at once. Each worker collects the whole file and runs its share of it, so a file that changed since the last run is still covered in full. `--no-split` turns this off, for suites with expensive class setup.
 - **Discovery doesn't import anything.** It walks the tree using your `python_files`, `testpaths` and `norecursedirs` settings, in milliseconds.
 
