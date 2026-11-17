@@ -3,7 +3,9 @@ mod schedule;
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Write};
+use std::net::Shutdown;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, ExitCode, Stdio};
 use std::sync::mpsc;
@@ -42,6 +44,9 @@ struct Args {
     /// Python interpreter (default: $VIRTUAL_ENV, the nearest .venv, the env this binary is installed in, python3)
     #[arg(long)]
     python: Option<PathBuf>,
+    /// Start every worker on its own, instead of forking them from one process that has imported what the last run's workers imported
+    #[arg(long)]
+    no_preload: bool,
     /// Files or directories (default: testpaths from the pytest config, else ".")
     paths: Vec<PathBuf>,
     /// Extra arguments for each pytest worker, after --
@@ -52,17 +57,63 @@ struct Args {
 enum Event {
     Line(usize, String),
     Eof(usize),
+    /// A forked worker connected: its task stream and pid.
+    Connected(usize, UnixStream, u32),
+    ZygoteGone,
+}
+
+enum Proc {
+    Spawned(Child),
+    /// The pid once the worker has connected.
+    Forked(Option<u32>),
+}
+
+/// Unless --no-preload: the process the workers are forked from.
+struct Zygote {
+    child: Child,
+    stdin: ChildStdin,
+    socket: PathBuf,
+}
+
+impl Zygote {
+    fn send(&mut self, command: Value) -> bool {
+        writeln!(self.stdin, "{command}").is_ok()
+    }
 }
 
 struct Worker {
-    child: Child,
-    stdin: ChildStdin,
+    proc: Proc,
+    stdin: Option<Box<dyn Write + Send>>,
     inflight: Vec<Task>,
     exited: bool,
     /// Told there is no more work: it will not ask again.
     closed: bool,
     /// The test it is running: node id, index in its file, where its output starts in the log, reruns it has left.
     running: Option<(String, usize, u64, u64)>,
+    /// Forked after the zygote died and replaced by a spawned worker: whatever it sends is ignored.
+    ghost: bool,
+}
+
+impl Worker {
+    fn new(proc: Proc, stdin: Option<Box<dyn Write + Send>>) -> Worker {
+        Worker { proc, stdin, inflight: vec![], exited: false, closed: false, running: None, ghost: false }
+    }
+}
+
+fn kill_all(workers: &mut [Worker], zygote: &mut Option<Zygote>) {
+    for w in workers {
+        match &mut w.proc {
+            Proc::Spawned(child) => {
+                let _ = child.kill();
+            }
+            Proc::Forked(Some(pid)) => {
+                if let Some(z) = zygote {
+                    z.send(json!({"kill": pid}));
+                }
+            }
+            Proc::Forked(None) => {} // told there is no work when it asks
+        }
+    }
 }
 
 /// One snapshots/snap_<module>.py under --snapshot-update, as the workers report it.
@@ -129,11 +180,29 @@ fn main() -> ExitCode {
     let say = |s: String| if pb.is_hidden() { println!("{s}") } else { pb.println(s) };
 
     let (tx, rx) = mpsc::channel();
-    let mut workers: Vec<Worker> = Vec::new();
-    let start_worker = |workers: &mut Vec<Worker>| workers.push(spawn(&python, &args.pytest_args, &logs, workers.len(), n, show_output, &tx));
-    for _ in 0..n {
-        start_worker(&mut workers);
+    let preload_file = durations_file.with_extension("modules.json");
+    let preload_key = cwd.strip_prefix(&cfg.rootdir).map_or(cwd.display().to_string(), |p| p.display().to_string());
+    let mut zygote = None;
+    if !args.no_preload {
+        let saved = read_json(&preload_file).get(&preload_key).cloned().unwrap_or(Value::Null);
+        zygote = start_zygote(&python, &args.pytest_args, &logs, n, show_output, &saved, &tx);
     }
+    let mut workers: Vec<Worker> = Vec::new();
+    let start_worker = |workers: &mut Vec<Worker>, zygote: &mut Option<Zygote>| {
+        let wid = workers.len();
+        let log = (!show_output).then(|| log_path(&logs, wid));
+        if zygote.as_mut().is_some_and(|z| z.send(json!({"fork": wid, "log": log}))) {
+            workers.push(Worker::new(Proc::Forked(None), None));
+        } else {
+            workers.push(spawn(&python, &args.pytest_args, &logs, wid, n, show_output, !args.no_preload, &tx));
+        }
+    };
+    for _ in 0..n {
+        start_worker(&mut workers, &mut zygote);
+    }
+    // What the workers imported, in the order first seen.
+    let mut imported: Vec<Value> = vec![];
+    let mut seen: HashSet<String> = HashSet::new();
 
     let mut queue: VecDeque<Task> = tasks.into();
     let mut results: BTreeMap<String, TestResult> = BTreeMap::new();
@@ -154,6 +223,33 @@ fn main() -> ExitCode {
     while alive > 0 {
         let Ok(event) = rx.recv() else { break };
         match event {
+            Event::Connected(wid, stream, pid) => {
+                let w = &mut workers[wid];
+                if w.ghost {
+                    let _ = stream.shutdown(Shutdown::Both);
+                } else {
+                    w.proc = Proc::Forked(Some(pid));
+                    w.stdin = Some(Box::new(stream));
+                }
+            }
+            Event::ZygoteGone => {
+                let log = fs::read_to_string(logs.join("zygote.log")).unwrap_or_default();
+                let tail: Vec<&str> = log.lines().rev().take(30).collect();
+                say(format!(
+                    "pytest-turbo: the process the workers are forked from died, starting workers without it\n{}",
+                    tail.into_iter().rev().collect::<Vec<_>>().join("\n")
+                ));
+                zygote = None;
+                for wid in 0..workers.len() {
+                    let w = &mut workers[wid];
+                    if matches!(w.proc, Proc::Forked(None)) && !w.closed {
+                        w.ghost = true;
+                        w.closed = true;
+                        start_worker(&mut workers, &mut zygote);
+                    }
+                }
+            }
+            Event::Line(wid, _) | Event::Eof(wid) if workers[wid].ghost => {}
             Event::Line(wid, line) => {
                 let Ok(msg) = serde_json::from_str::<Value>(&line) else {
                     say(format!("pytest-turbo: unreadable worker output: {line}"));
@@ -168,7 +264,9 @@ fn main() -> ExitCode {
                             Some(t) => w.inflight.push(t),
                             None => w.closed = true,
                         }
-                        let _ = w.stdin.write_all(line.as_bytes());
+                        if let Some(stdin) = w.stdin.as_mut() {
+                            let _ = stdin.write_all(line.as_bytes());
+                        }
                     }
                     "test" => {
                         let r = TestResult {
@@ -195,9 +293,7 @@ fn main() -> ExitCode {
                             if maxfail.is_some_and(|m| failed >= m) && !stopping {
                                 stopping = true;
                                 queue.clear();
-                                for w in &mut workers {
-                                    let _ = w.child.kill();
-                                }
+                                kill_all(&mut workers, &mut zygote);
                             }
                         } else if r.reruns > 0 {
                             say(format!("{} {nodeid} passed after {} rerun(s)", style("FLAKY").yellow().bold(), r.reruns));
@@ -230,7 +326,7 @@ fn main() -> ExitCode {
                             queue.push_front(Task { path, cuts: vec![], chunk: 0, estimate: None, only: Some(nodeid.clone()), attempt: *attempt, from: 0 });
                             awaiting_rerun.insert(nodeid);
                             if workers.iter().all(|w| w.closed) {
-                                start_worker(&mut workers);
+                                start_worker(&mut workers, &mut zygote);
                                 alive += 1;
                             }
                         }
@@ -259,7 +355,14 @@ fn main() -> ExitCode {
                         say(format!("{} {path}", style("COLLECT ERROR").red().bold()));
                         errors.push((format!("collect error: {path}"), msg["error"].as_str().unwrap_or("").to_string()));
                     }
-                    "exit" => w.exited = true,
+                    "exit" => {
+                        w.exited = true;
+                        for m in msg["modules"].as_array().into_iter().flatten() {
+                            if seen.insert(m.to_string()) {
+                                imported.push(m.clone());
+                            }
+                        }
+                    }
                     other => say(format!("pytest-turbo: unknown worker event {other}")),
                 }
             }
@@ -267,7 +370,9 @@ fn main() -> ExitCode {
                 alive -= 1;
                 let w = &mut workers[wid];
                 w.closed = true;
-                let _ = w.child.wait();
+                if let Proc::Spawned(child) = &mut w.proc {
+                    let _ = child.wait();
+                }
                 if w.exited || stopping {
                     continue;
                 }
@@ -294,7 +399,7 @@ fn main() -> ExitCode {
                         queue.extend(tasks.drain(..));
                         if restarts < MAX_RESTARTS {
                             restarts += 1;
-                            start_worker(&mut workers);
+                            start_worker(&mut workers, &mut zygote);
                             alive += 1;
                         } else {
                             errors.push(("too many worker crashes, stopped".into(), tail));
@@ -318,9 +423,7 @@ fn main() -> ExitCode {
                         stopping = true;
                         queue.clear();
                         tasks.clear();
-                        for w in &mut workers {
-                            let _ = w.child.kill();
-                        }
+                        kill_all(&mut workers, &mut zygote);
                     }
                     queue.extend(tasks.drain(..)); // fetched ahead, not started
                 }
@@ -335,7 +438,7 @@ fn main() -> ExitCode {
                 }
                 if !queue.is_empty() && restarts < MAX_RESTARTS {
                     restarts += 1;
-                    start_worker(&mut workers);
+                    start_worker(&mut workers, &mut zygote);
                     alive += 1;
                 } else if !queue.is_empty() {
                     errors.push(("too many worker crashes, stopped".into(), tail));
@@ -345,6 +448,17 @@ fn main() -> ExitCode {
         }
     }
     pb.finish_and_clear();
+    if let Some(z) = zygote.take() {
+        let Zygote { mut child, stdin, socket } = z;
+        drop(stdin); // it exits at the end of its input
+        let _ = child.wait();
+        let _ = fs::remove_file(&socket);
+    }
+    if !args.no_preload && !stopping && !imported.is_empty() {
+        update_json(&preload_file, |saved| {
+            saved.insert(preload_key, json!({"modules": imported}));
+        });
+    }
     if !stopping {
         errors.extend(awaiting_rerun.into_iter().map(|id| (format!("rerun never reported: {id}"), String::new())));
     }
@@ -367,8 +481,12 @@ fn main() -> ExitCode {
     ExitCode::from(if results.is_empty() && ok { 5 } else if ok { 0 } else { 1 })
 }
 
-fn spawn(python: &Path, pytest_args: &[String], logs: &Path, wid: usize, n: usize, show_output: bool, tx: &mpsc::Sender<Event>) -> Worker {
+#[allow(clippy::too_many_arguments)]
+fn spawn(python: &Path, pytest_args: &[String], logs: &Path, wid: usize, n: usize, show_output: bool, record: bool, tx: &mpsc::Sender<Event>) -> Worker {
     let mut cmd = Command::new(python);
+    if record {
+        cmd.env("PYTEST_TURBO_RECORD", "1");
+    }
     if show_output {
         cmd.env("PYTEST_TURBO_OUTPUT", "1").stderr(Stdio::inherit());
     } else {
@@ -387,16 +505,76 @@ fn spawn(python: &Path, pytest_args: &[String], logs: &Path, wid: usize, n: usiz
         .unwrap_or_else(|e| panic!("cannot start {}: {e}", python.display()));
     let stdout = child.stdout.take().unwrap();
     let tx = tx.clone();
-    thread::spawn(move || {
-        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-            if tx.send(Event::Line(wid, line)).is_err() {
-                return;
-            }
-        }
-        let _ = tx.send(Event::Eof(wid));
-    });
+    thread::spawn(move || forward(wid, BufReader::new(stdout).lines(), &tx));
     let stdin = child.stdin.take().unwrap();
-    Worker { child, stdin, inflight: vec![], exited: false, closed: false, running: None }
+    Worker::new(Proc::Spawned(child), Some(Box::new(stdin)))
+}
+
+fn forward(wid: usize, lines: impl Iterator<Item = io::Result<String>>, tx: &mpsc::Sender<Event>) {
+    for line in lines.map_while(Result::ok) {
+        if tx.send(Event::Line(wid, line)).is_err() {
+            return;
+        }
+    }
+    let _ = tx.send(Event::Eof(wid));
+}
+
+/// Starts the process the workers are forked from. `None` if it can't start: the workers are then spawned.
+fn start_zygote(
+    python: &Path,
+    pytest_args: &[String],
+    logs: &Path,
+    n: usize,
+    show_output: bool,
+    saved: &Value,
+    tx: &mpsc::Sender<Event>,
+) -> Option<Zygote> {
+    let socket = std::env::temp_dir().join(format!("pytest-turbo-{}.sock", std::process::id()));
+    let _ = fs::remove_file(&socket);
+    let listener = UnixListener::bind(&socket).map_err(|e| eprintln!("pytest-turbo: not preloading, cannot listen on {}: {e}", socket.display())).ok()?;
+    let mut cmd = Command::new(python);
+    if show_output {
+        cmd.env("PYTEST_TURBO_OUTPUT", "1").stderr(Stdio::inherit());
+    } else {
+        cmd.stderr(File::create(logs.join("zygote.log")).expect("zygote log"));
+    }
+    let mut child = cmd
+        .arg("-c")
+        .arg(WORKER_PY)
+        .args(pytest_args)
+        .env("PYTEST_TURBO_ZYGOTE", &socket)
+        .env("PYTEST_TURBO_RECORD", "1")
+        .env("PYTEST_XDIST_WORKER_COUNT", n.to_string())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .map_err(|e| eprintln!("pytest-turbo: not preloading, cannot start {}: {e}", python.display()))
+        .ok()?;
+    let mut stdin = child.stdin.take().unwrap();
+    writeln!(stdin, "{saved}").ok()?;
+    let mut stdout = child.stdout.take().unwrap();
+    let gone = tx.clone();
+    // The workers close their copy of this pipe, so its end means the zygote itself has exited.
+    thread::spawn(move || {
+        let _ = io::copy(&mut stdout, &mut io::sink());
+        let _ = gone.send(Event::ZygoteGone);
+    });
+    let tx = tx.clone();
+    thread::spawn(move || {
+        for stream in listener.incoming().map_while(Result::ok) {
+            let tx = tx.clone();
+            thread::spawn(move || {
+                let Ok(read) = stream.try_clone() else { return };
+                let mut lines = BufReader::new(read).lines();
+                let Some(hello) = lines.next().and_then(Result::ok).and_then(|l| serde_json::from_str::<Value>(&l).ok()) else { return };
+                let (Some(wid), Some(pid)) = (hello["wid"].as_u64(), hello["pid"].as_u64()) else { return };
+                if tx.send(Event::Connected(wid as usize, stream, pid as u32)).is_ok() {
+                    forward(wid as usize, lines, &tx);
+                }
+            });
+        }
+    });
+    Some(Zygote { child, stdin, socket })
 }
 
 /// Writes each snapshot file once, after every worker is done: entries kept as they were, updated
@@ -443,19 +621,29 @@ fn log_path(logs: &Path, wid: usize) -> PathBuf {
 
 /// Keys are stored relative to the rootdir, so the file stays valid when the checkout moves (CI).
 fn load_durations(file: &Path, rootdir: &Path) -> Durations {
-    let stored: Durations = fs::read_to_string(file).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+    let stored: Durations = serde_json::from_value(Value::Object(read_json(file))).unwrap_or_default();
     stored.into_iter().map(|(k, v)| (rootdir.join(k).display().to_string(), v)).collect()
 }
 
-/// Merged into the file as it is now (other suites may have written to it meanwhile), then
-/// written to a temporary file and renamed, so concurrent runs never see half of one.
 fn save_durations(file: &Path, rootdir: &Path, measured: &Durations) {
-    let mut relative: Durations = fs::read_to_string(file).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
-    relative.extend(
-        measured.iter().map(|(k, v)| (Path::new(k).strip_prefix(rootdir).map_or(k.clone(), |p| p.display().to_string()), v.clone())),
-    );
+    update_json(file, |saved| {
+        for (k, v) in measured {
+            saved.insert(Path::new(k).strip_prefix(rootdir).map_or(k.clone(), |p| p.display().to_string()), json!(v));
+        }
+    });
+}
+
+fn read_json(file: &Path) -> serde_json::Map<String, Value> {
+    fs::read_to_string(file).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+}
+
+/// Applied to the file as it is now (other suites may have written to it meanwhile), then
+/// written to a temporary file and renamed, so concurrent runs never see half of one.
+fn update_json(file: &Path, update: impl FnOnce(&mut serde_json::Map<String, Value>)) {
+    let mut saved = read_json(file);
+    update(&mut saved);
     let tmp = file.with_extension(format!("tmp{}", std::process::id()));
-    let written = file.parent().map_or(Ok(()), fs::create_dir_all).and_then(|_| fs::write(&tmp, serde_json::to_string(&relative).unwrap()));
+    let written = file.parent().map_or(Ok(()), fs::create_dir_all).and_then(|_| fs::write(&tmp, Value::Object(saved).to_string()));
     if written.and_then(|_| fs::rename(&tmp, file)).is_err() {
         eprintln!("pytest-turbo: could not write {}", file.display());
         let _ = fs::remove_file(&tmp);

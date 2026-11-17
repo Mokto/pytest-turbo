@@ -11,17 +11,25 @@ controller runs it again as its own task.
 
 Snapshots replace snapshottest, with its keys and its snapshots/snap_<module>.py files. Workers
 compare; with --snapshot-update they send entries to the controller, which writes each file once.
+
+With --preload, one process runs serve_forks: it imports what the workers of the last run
+imported, then forks a worker whenever the binary asks, and the workers share those pages.
 """
 
 import ast
 import bisect
 import difflib
 import faulthandler
+import fnmatch
+import gc
+import importlib
+import importlib.util
 import json
 import os
 import pprint
 import re
 import signal
+import socket
 import sys
 from collections import Counter
 
@@ -157,6 +165,7 @@ class TurboWorker:
         group.addoption("--snapshot-update", action="store_true", help="Write snapshots instead of comparing them")
 
     def pytest_configure(self, config):
+        self.config = config
         self.rootpath = config.rootpath
         self.snapshot_update = config.getoption("snapshot_update")
         self.reruns = config.getoption("reruns")
@@ -299,6 +308,18 @@ class TurboWorker:
     def failure(report, when):
         return {"when": when, "text": report.longreprtext, "sections": report.sections}
 
+    def imported(self):
+        """Modules to preload next time: all but test modules and conftests, whose asserts pytest rewrites on import."""
+        patterns = [*self.config.getini("python_files"), "conftest.py"]
+        modules = []
+        for name, module in list(sys.modules.items()):
+            file = getattr(module, "__file__", None)
+            if module is None or name == "__main__" or type(getattr(module, "__loader__", None)).__name__ == "AssertionRewritingHook":
+                continue
+            if not any(fnmatch.fnmatch(os.path.basename(file or ""), p) for p in patterns):
+                modules.append([name, file])
+        return {"modules": modules}
+
     def pytest_runtest_logfinish(self, nodeid):
         r = self.results.get(nodeid)
         if r is None:
@@ -311,17 +332,81 @@ class TurboWorker:
             self.send(type="test", nodeid=nodeid, path=path, index=index, **r)
 
 
+def pytest_args():
+    # pytest-rerunfailures, pytest-timeout and snapshottest clash with TurboWorker's options and fixture.
+    blocked = ["-p", "no:rerunfailures", "-p", "no:timeout", "-p", "no:snapshottest"]
+    return ["-p", "no:cacheprovider", *blocked, *sys.argv[1:]]
+
+
+def load_initial_conftests():
+    """Run the conftests a worker loads before collecting, for what they set up on import (environment variables)."""
+    from _pytest.config import _prepareconfig
+
+    try:
+        config = _prepareconfig(pytest_args(), plugins=[TurboWorker(None, None)])
+    except BaseException as exc:  # the workers will report it
+        print(f"pytest-turbo: loading the conftests failed: {exc!r}", file=sys.stderr)
+        return
+    config._ensure_unconfigure()  # removes pytest's import hook and fd capture
+
+
+def preload(saved):
+    if not saved:
+        return
+    load_initial_conftests()
+    # Only what resolves to the same file without the test directories pytest adds to sys.path: what those
+    # provide (helpers, the many packages named "tests") depends on which test files a worker collects.
+    for name, file in saved["modules"]:
+        try:
+            spec = importlib.util.find_spec(name)
+            if spec is not None and spec.origin == file:
+                importlib.import_module(name)
+        except (Exception, SystemExit):  # gone since the last run: the worker imports what it needs itself
+            pass
+    gc.collect()
+    gc.freeze()  # otherwise every collection in a worker writes to the shared objects and copies their pages
+
+
+def serve_forks(address):
+    """Returns only in a forked worker, with its event and task streams."""
+    preload(json.loads(sys.stdin.readline()))
+    signal.signal(signal.SIGCHLD, signal.SIG_IGN)  # the kernel reaps the workers
+    for line in sys.stdin:
+        command = json.loads(line)
+        if "kill" in command:
+            try:
+                os.kill(command["kill"], signal.SIGKILL)
+            except OSError:
+                pass
+        elif os.fork() == 0:
+            signal.signal(signal.SIGCHLD, signal.SIG_DFL)
+            wid = command["fork"]
+            os.environ["PYTEST_XDIST_WORKER"] = f"gw{wid}"
+            if command["log"]:
+                os.dup2(os.open(command["log"], os.O_WRONLY | os.O_CREAT | os.O_TRUNC), 2)
+            sock = socket.socket(socket.AF_UNIX)
+            sock.connect(address)
+            events = sock.makefile("w", buffering=1, encoding="utf-8")
+            events.write(json.dumps({"type": "hello", "wid": wid, "pid": os.getpid()}) + "\n")
+            return events, sock.makefile("r", encoding="utf-8")
+    sys.exit(0)
+
+
 def main():
     sys.argv[0] = os.path.join(os.path.dirname(sys.executable), "pytest")  # code that checks "am I under pytest" by argv[0]
-    events = os.fdopen(os.dup(1), "w", buffering=1)
-    inbox = os.fdopen(os.dup(0), "r")
-    os.dup2(2 if os.environ.pop("PYTEST_TURBO_OUTPUT", None) else os.open(os.devnull, os.O_WRONLY), 1)
+    output = os.environ.pop("PYTEST_TURBO_OUTPUT", None)
+    record = os.environ.pop("PYTEST_TURBO_RECORD", None)
+    zygote = os.environ.pop("PYTEST_TURBO_ZYGOTE", None)
+    if zygote:
+        events, inbox = serve_forks(zygote)
+    else:
+        events = os.fdopen(os.dup(1), "w", buffering=1)
+        inbox = os.fdopen(os.dup(0), "r")
+    os.dup2(2 if output else os.open(os.devnull, os.O_WRONLY), 1)
     os.dup2(os.open(os.devnull, os.O_RDONLY), 0)
     plugin = TurboWorker(events, inbox)
-    # pytest-rerunfailures, pytest-timeout and snapshottest clash with the options and fixture above.
-    blocked = ["-p", "no:rerunfailures", "-p", "no:timeout", "-p", "no:snapshottest"]
-    code = pytest.main(["-p", "no:cacheprovider", *blocked, *sys.argv[1:]], plugins=[plugin])
-    plugin.send(type="exit", code=int(code))
+    code = pytest.main(pytest_args(), plugins=[plugin])
+    plugin.send(type="exit", code=int(code), **(plugin.imported() if record and hasattr(plugin, "config") else {}))
 
 
 main()

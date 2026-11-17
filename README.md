@@ -77,6 +77,17 @@ On two real suites, compared with `pytest -n auto --dist loadfile`:
 | 1,272 unit tests, 18 workers | 15–21 s | 7.5–12 s |
 | 1,603 tests against Postgres and ScyllaDB, 8 workers | 23–26 s | 17–21 s |
 
+### Less memory: shared imports
+
+Every worker imports the same packages and the code under test, often most of what it uses. So one process imports them once and the workers are forked from it, sharing that memory instead of each holding a copy. On a suite of 1,400 tests with 8 workers, peak memory went from 3.6 GiB to 1.7 GiB. `--no-preload` starts every worker on its own instead.
+
+- Each run records what the workers imported, except test modules and `conftest.py` files, in a file next to the durations file (`durations.modules.json` by default). The next run imports those modules before forking. The first run has nothing to import yet and uses as much memory as with `--no-preload`.
+- Before importing them, that process loads the `conftest.py` files a worker loads before collecting, so modules that read environment variables on import see what those conftests set. It has `PYTEST_XDIST_WORKER_COUNT` and `sys.argv[0]` set as in a worker, but no `PYTEST_XDIST_WORKER`: a module that reads its worker id on import gets it wrong.
+- Modules that resolve to another file without the test directories pytest adds to `sys.path`, such as test helpers or the many packages named `tests`, are left to the workers, as are modules that fail to import.
+- Threads that the imported code starts don't exist in the forked workers. If a suite behaves differently than with `--no-preload`, this is the first suspect.
+- If the process the workers are forked from dies, the run goes on with workers started the usual way.
+- The list only grows, since the workers report what was preloaded too. Delete the file to start over.
+
 ## Output
 
 - Failures appear as they happen. At the end, each failure is printed in full with its captured stdout, stderr and log output.
