@@ -61,6 +61,7 @@ A Rust binary finds the test files, plans the order and runs one long-lived pyte
 ## Limits
 
 - Package-scoped fixtures are set up again for each file a worker runs.
+- `collect_ignore` and `collect_ignore_glob` in a `conftest.py` are not applied; `--ignore` and `--ignore-glob` after `--` are.
 - No JUnit XML output yet.
 - Not tested on Windows.
 

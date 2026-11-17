@@ -10,6 +10,8 @@ pub struct Config {
     pub testpaths: Vec<String>,
     python_files: Vec<GlobMatcher>,
     norecursedirs: Vec<GlobMatcher>,
+    ignore: Vec<PathBuf>,
+    ignore_glob: Vec<GlobMatcher>,
 }
 
 /// The pytest settings that decide which files exist as tests, read the way pytest finds its
@@ -31,6 +33,38 @@ pub fn load(cwd: &Path) -> Config {
         testpaths: get("testpaths").unwrap_or_default(),
         python_files: globs(get("python_files").unwrap_or_else(|| vec!["test_*.py".into(), "*_test.py".into()])),
         norecursedirs: globs(get("norecursedirs").unwrap_or_else(|| DEFAULT_NORECURSE.iter().map(|s| s.to_string()).collect())),
+        ignore: Vec::new(),
+        ignore_glob: Vec::new(),
+    }
+}
+
+impl Config {
+    /// `--ignore` and `--ignore-glob` from the pytest arguments. pytest never applies them to the paths
+    /// on its command line, and the workers get every file that way, so discovery has to.
+    pub fn add_ignores(&mut self, pytest_args: &[String], cwd: &Path) {
+        let cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+        let mut args = pytest_args.iter();
+        while let Some(arg) = args.next() {
+            for (flag, glob) in [("--ignore", false), ("--ignore-glob", true)] {
+                let value = match arg.strip_prefix(flag) {
+                    Some("") => args.clone().next().cloned(),
+                    Some(v) if v.starts_with('=') => Some(v[1..].to_string()),
+                    _ => None,
+                };
+                let Some(value) = value else { continue };
+                let path = cwd.join(&value);
+                if glob {
+                    // pytest fnmatches the absolute path, where `*` also crosses `/`
+                    self.ignore_glob.extend(Glob::new(&path.display().to_string()).ok().map(|g| g.compile_matcher()));
+                } else {
+                    self.ignore.push(path.canonicalize().unwrap_or(path));
+                }
+            }
+        }
+    }
+
+    fn ignored(&self, path: &Path) -> bool {
+        self.ignore.iter().any(|p| p == path) || self.ignore_glob.iter().any(|g| g.is_match(path))
     }
 }
 
@@ -104,6 +138,9 @@ fn walk(dir: &Path, cfg: &Config, out: &mut Vec<(String, u64)>) {
         let path = entry.path();
         let name = entry.file_name();
         let Ok(kind) = entry.file_type() else { continue };
+        if cfg.ignored(&path) {
+            continue;
+        }
         if kind.is_dir() {
             let skip = name == "__pycache__"
                 || path.join("pyvenv.cfg").exists()

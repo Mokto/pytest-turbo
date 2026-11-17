@@ -73,7 +73,8 @@ fn main() -> ExitCode {
     let args = Args::parse();
     let start = Instant::now();
     let cwd = std::env::current_dir().expect("cwd");
-    let cfg = config::load(&cwd);
+    let mut cfg = config::load(&cwd);
+    cfg.add_ignores(&args.pytest_args, &cwd);
     let roots = if !args.paths.is_empty() {
         args.paths.clone()
     } else if cfg.rootdir == cwd && !cfg.testpaths.is_empty() {

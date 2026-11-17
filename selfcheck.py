@@ -137,6 +137,13 @@ with tempfile.TemporaryDirectory() as tmp:
     assert set(json.loads(elsewhere.read_text())) == {"pkg/case_test.py", "test_big.py"}, "a run dropped another suite's durations"
     print("durations file: ok")
 
+    ignored = Path(tmp, "ignored/durations.json")
+    subprocess.run([TURBO, "--python", sys.executable, "--durations-file", str(ignored), "--", "--ignore-glob=*big*", "--ignore", "pkg"], cwd=tmp, capture_output=True, env=env)
+    kept = set(json.loads(ignored.read_text()))
+    assert "test_big.py" not in kept and not any(k.startswith("pkg/") for k in kept) and "test_crash.py" in kept, kept
+    os.remove(Path(tmp, "crashed_once"))
+    print("--ignore: ok")
+
     turbo = subprocess.run([TURBO, "-x", "-n", "2", "--python", sys.executable], cwd=tmp, capture_output=True, text=True, env=env)
     got = counts(last_line(turbo.stdout))
     assert turbo.returncode == 1 and got["failed"] == 1 and got.get("passed", 0) < want["passed"], turbo.stdout
