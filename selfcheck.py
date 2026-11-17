@@ -59,7 +59,13 @@ class WeirdlyNamed(unittest.TestCase):
             with self.subTest(i=i):
                 self.assertGreaterEqual(i, 0)
 """,
-    "test_big.py": "".join(f"def test_{i}():\n    pass\n\n" for i in range(40)),
+    "test_big.py": "import os\nimport pytest\n\n"
+    + "".join(
+        f'@pytest.mark.xdist_group("g")\ndef test_{i}():\n    open("groups.txt", "a").write(os.environ.get("PYTEST_XDIST_WORKER", "main") + "\\n")\n\n'
+        if i in (0, 39)
+        else f"def test_{i}():\n    pass\n\n"
+        for i in range(40)
+    ),
     "test_crash.py": """
 import os
 
@@ -99,6 +105,7 @@ with tempfile.TemporaryDirectory() as tmp:
     plain = subprocess.run([sys.executable, "-m", "pytest", "-p", "no:cacheprovider"], cwd=tmp, capture_output=True, text=True, env=env)
     want = counts(last_line(plain.stdout))
     os.remove(Path(tmp, "crashed_once"))
+    os.remove(Path(tmp, "groups.txt"))
 
     # Make test_big.py look slow so the scheduler splits it across workers.
     big = str(Path(tmp, "test_big.py").resolve())
@@ -114,6 +121,9 @@ with tempfile.TemporaryDirectory() as tmp:
         assert "assert 1 == 2" in turbo.stdout and "some captured output" in turbo.stdout, turbo.stdout
         assert "CRASH" in turbo.stdout and "test_crash.py" in turbo.stdout, turbo.stdout
         assert "2 subtests passed" in last_line(turbo.stdout), turbo.stdout
+        group_workers = Path(tmp, "groups.txt").read_text().split()
+        assert len(group_workers) == 2 and len(set(group_workers)) == 1, f"xdist_group split across workers: {group_workers}"
+        os.remove(Path(tmp, "groups.txt"))
         print(f"-n {workers}: ok {got}")
 
     cache = json.loads(Path(tmp, ".pytest-turbo/durations.json").read_text())
@@ -123,6 +133,8 @@ with tempfile.TemporaryDirectory() as tmp:
     elsewhere = Path(tmp, "elsewhere/durations.json")
     subprocess.run([TURBO, "--python", sys.executable, "--durations-file", str(elsewhere), "pkg"], cwd=tmp, capture_output=True, env=env)
     assert set(json.loads(elsewhere.read_text())) == {"pkg/case_test.py"}, elsewhere.read_text()
+    subprocess.run([TURBO, "--python", sys.executable, "--durations-file", str(elsewhere), "test_big.py"], cwd=tmp, capture_output=True, env=env)
+    assert set(json.loads(elsewhere.read_text())) == {"pkg/case_test.py", "test_big.py"}, "a run dropped another suite's durations"
     print("durations file: ok")
 
     turbo = subprocess.run([TURBO, "-x", "-n", "2", "--python", sys.executable], cwd=tmp, capture_output=True, text=True, env=env)

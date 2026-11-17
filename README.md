@@ -21,7 +21,7 @@ pytest-turbo -- -k slow --tb=long  # anything after -- goes to pytest
 
 It runs pytest with the Python of `$VIRTUAL_ENV`, else the nearest `.venv`, else the environment it is installed in. `--python` picks another.
 
-Each worker gets `PYTEST_XDIST_WORKER` (`gw0`, `gw1`, …) and `PYTEST_XDIST_WORKER_COUNT`, as under pytest-xdist, so suites that give each worker its own database keep working.
+Each worker gets `PYTEST_XDIST_WORKER` (`gw0`, `gw1`, …) and `PYTEST_XDIST_WORKER_COUNT`, as under pytest-xdist, so suites that give each worker its own database keep working. Tests marked `@pytest.mark.xdist_group(name)` in one file always run on the same worker, even when the file is split.
 
 ### In CI
 
@@ -31,7 +31,7 @@ The speedup depends on knowing test durations from earlier runs. On a fresh chec
 pytest-turbo --durations-file /persistent/cache/my-suite.json
 ```
 
-Paths in it are relative to the pytest rootdir, and it is replaced atomically, so parallel jobs can share it.
+Paths in it are relative to the pytest rootdir. Each run merges its results into the file and replaces it atomically, so parallel jobs and different suites can share one file.
 
 ## Why it's faster than xdist
 

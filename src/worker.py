@@ -4,6 +4,7 @@ A task line is "path<TAB>cuts<TAB>chunk": collect the whole file, run items[cuts
 An empty line means no more work. Events go out as JSON lines.
 """
 
+import bisect
 import json
 import os
 import sys
@@ -36,11 +37,17 @@ class TurboWorker:
                 self.send(type="collect_error", path=path, error=repr(exc))
                 items = []
             bounds = [0, *(min(int(c), len(items)) for c in cuts.split(",") if c), len(items)]
-            lo, hi = bounds[int(chunk)], bounds[int(chunk) + 1]
-            for i, item in enumerate(items[lo:hi], lo):
-                self.where[item.nodeid] = (path, i)
-            if lo < hi:
-                return path, int(chunk), items[lo:hi]
+            mine, owner = [], {}
+            for i, item in enumerate(items):
+                at = bisect.bisect_right(bounds, i) - 1
+                group = item.get_closest_marker("xdist_group")
+                if group:  # as with --dist loadgroup, a group runs on one worker: the chunk of its first test
+                    at = owner.setdefault(group.args[0] if group.args else group.kwargs.get("name"), at)
+                if at == int(chunk):
+                    self.where[item.nodeid] = (path, i)
+                    mine.append(item)
+            if mine:
+                return path, int(chunk), mine
             self.send(type="done", path=path, chunk=int(chunk))
 
     def pytest_configure(self, config):

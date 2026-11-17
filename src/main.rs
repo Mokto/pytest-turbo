@@ -217,13 +217,10 @@ fn main() -> ExitCode {
     }
     pb.finish_and_clear();
 
+    let measured: Durations = durations.into_iter().filter(|(path, _)| chunks_done.get(path) == chunks_per_file.get(path)).collect();
+    save_durations(&durations_file, &cfg.rootdir, &measured);
     let mut cache = known;
-    for (path, d) in durations {
-        if chunks_done.get(&path) == chunks_per_file.get(&path) {
-            cache.insert(path, d);
-        }
-    }
-    save_durations(&durations_file, &cfg.rootdir, &cache);
+    cache.extend(measured);
 
     report(&results, &errors, &files, &cache, start, discovery, n, &cwd);
     let ok = errors.is_empty() && failed == 0;
@@ -267,12 +264,13 @@ fn load_durations(file: &Path, rootdir: &Path) -> Durations {
     stored.into_iter().map(|(k, v)| (rootdir.join(k).display().to_string(), v)).collect()
 }
 
-/// Written to a temporary file and renamed, so concurrent runs sharing the file never see half of one.
-fn save_durations(file: &Path, rootdir: &Path, cache: &Durations) {
-    let relative: Durations = cache
-        .iter()
-        .map(|(k, v)| (Path::new(k).strip_prefix(rootdir).map_or(k.clone(), |p| p.display().to_string()), v.clone()))
-        .collect();
+/// Merged into the file as it is now (other suites may have written to it meanwhile), then
+/// written to a temporary file and renamed, so concurrent runs never see half of one.
+fn save_durations(file: &Path, rootdir: &Path, measured: &Durations) {
+    let mut relative: Durations = fs::read_to_string(file).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+    relative.extend(
+        measured.iter().map(|(k, v)| (Path::new(k).strip_prefix(rootdir).map_or(k.clone(), |p| p.display().to_string()), v.clone())),
+    );
     let tmp = file.with_extension(format!("tmp{}", std::process::id()));
     let written = file.parent().map_or(Ok(()), fs::create_dir_all).and_then(|_| fs::write(&tmp, serde_json::to_string(&relative).unwrap()));
     if written.and_then(|_| fs::rename(&tmp, file)).is_err() {
