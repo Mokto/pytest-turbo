@@ -19,4 +19,5 @@ jobs:
       - uses: astral-sh/setup-uv@v6
       - run: cargo clippy --release -- -D warnings
       - run: cargo test --release
-      - run: uv run --no-project --with pytest --with pytest-rerunfailures python selfcheck.py
+      - run: uv run --no-project --with pytest python selfcheck.py
+      - run: uv run --no-project --with pytest --with pytest-rerunfailures --with pytest-timeout python selfcheck.py  # both blocked in the workers

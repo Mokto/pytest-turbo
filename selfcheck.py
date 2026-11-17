@@ -101,9 +101,11 @@ with tempfile.TemporaryDirectory() as tmp:
     Path(tmp, "pyproject.toml").write_text("[tool.pytest.ini_options]\n")
     env = {**os.environ, "NO_COLOR": "1"}
 
-    Path(tmp, "crashed_once").touch()  # plain pytest can't survive the crash, so it gets the second attempt's behaviour
+    Path(tmp, "crashed_once").touch()  # plain pytest can't survive the crash: it runs test_kills_worker as a pass
     plain = subprocess.run([sys.executable, "-m", "pytest", "-p", "no:cacheprovider"], cwd=tmp, capture_output=True, text=True, env=env)
     want = counts(last_line(plain.stdout))
+    want["passed"] -= 1  # under pytest-turbo it kills its worker and is reported as an error
+    want["error"] = 1
     os.remove(Path(tmp, "crashed_once"))
     os.remove(Path(tmp, "groups.txt"))
 
@@ -119,7 +121,7 @@ with tempfile.TemporaryDirectory() as tmp:
         assert got == want, f"-n {workers}: turbo {got} != pytest {want}\n{turbo.stdout}"
         assert turbo.returncode == 1, turbo.returncode
         assert "assert 1 == 2" in turbo.stdout and "some captured output" in turbo.stdout, turbo.stdout
-        assert "CRASH" in turbo.stdout and "test_crash.py" in turbo.stdout, turbo.stdout
+        assert "CRASH" in turbo.stdout and "test_crash.py::test_kills_worker" in turbo.stdout, turbo.stdout
         assert "2 subtests passed" in last_line(turbo.stdout), turbo.stdout
         group_workers = Path(tmp, "groups.txt").read_text().split()
         assert len(group_workers) == 2 and len(set(group_workers)) == 1, f"xdist_group split across workers: {group_workers}"
@@ -166,3 +168,39 @@ with tempfile.TemporaryDirectory() as tmp:
     turbo = subprocess.run([TURBO, "-n", "2", "--python", sys.executable, str(env_test), str(flaky)], cwd=tmp, capture_output=True, text=True, env=env)
     assert turbo.returncode == 0, turbo.stdout
     print("xdist env: ok")
+
+# Reruns and timeouts are pytest-turbo's own, configured the way pytest-rerunfailures and pytest-timeout are.
+with tempfile.TemporaryDirectory() as tmp:
+    Path(tmp, "pyproject.toml").write_text(
+        '[tool.pytest.ini_options]\naddopts = "--reruns 2 --only-rerun \'ConnectionError: flaky\'"\ntimeout = 1\n'
+    )
+    Path(tmp, "test_x.py").write_text(
+        "import os, time, pytest\n\n"
+        "def test_flaky_twice():\n"
+        "    n = os.path.getsize('tries') if os.path.exists('tries') else 0\n"
+        "    open('tries', 'a').write('x')\n"
+        "    if n < 2:\n        raise ConnectionError('flaky')\n\n"
+        "def test_other_error_is_not_rerun():\n"
+        "    open('other', 'a').write('x')\n"
+        "    raise ValueError('flaky')\n\n"
+        "def test_slow():\n    time.sleep(5)\n\n"
+        "def test_hangs_in_c():\n    import signal\n    signal.signal(signal.SIGALRM, signal.SIG_IGN)\n    time.sleep(60)\n\n"
+        "@pytest.mark.timeout(3)\ndef test_marker_allows_more():\n    time.sleep(1.5)\n\n"
+        "def test_prints():\n    print('visible with -s')\n"
+    )
+    env = {**os.environ, "NO_COLOR": "1"}
+    turbo = subprocess.run([TURBO, "-n", "2", "--python", sys.executable], cwd=tmp, capture_output=True, text=True, env=env)
+    out = turbo.stdout
+    assert counts(last_line(out)) == {"passed": 3, "failed": 2, "error": 1}, out
+    assert "test_x.py::test_hangs_in_c (crash" in out and 'test_x.py", line 19 in test_hangs_in_c' in out, out
+    assert "FLAKY" in out and "test_flaky_twice passed after 2 rerun(s)" in out, out
+    assert Path(tmp, "tries").read_text() == "xxx" and Path(tmp, "other").read_text() == "x", "rerun counts"
+    assert "Timeout (>1.0s) from pytest-turbo" in out, out
+    print("reruns and timeout from addopts and ini: ok")
+
+    node = subprocess.run(
+        [TURBO, "--python", sys.executable, "test_x.py::test_prints", "--", "-s"], cwd=tmp, capture_output=True, text=True, env=env
+    )
+    assert node.returncode == 0 and counts(last_line(node.stdout)) == {"passed": 1}, node.stdout
+    assert "visible with -s" in node.stdout + node.stderr, node.stdout + node.stderr
+    print("node id and -s: ok")

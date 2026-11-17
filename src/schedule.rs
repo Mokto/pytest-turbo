@@ -12,12 +12,18 @@ pub struct Task {
     pub cuts: Vec<usize>,
     pub chunk: usize,
     pub estimate: Option<f64>,
+    /// A rerun: only this test, on its `attempt`-th rerun.
+    pub only: Option<String>,
+    pub attempt: u64,
+    /// Skip the file's tests before this index: the ones a crashed worker already ran.
+    pub from: usize,
 }
 
 impl Task {
     pub fn line(&self) -> String {
         let cuts: Vec<String> = self.cuts.iter().map(|c| c.to_string()).collect();
-        format!("{}\t{}\t{}\n", self.path, cuts.join(","), self.chunk)
+        let only = self.only.as_deref().unwrap_or("");
+        format!("{}\t{}\t{}\t{only}\t{}\t{}\n", self.path, cuts.join(","), self.chunk, self.attempt, self.from)
     }
 }
 
@@ -29,7 +35,7 @@ pub fn plan(files: &[(String, u64)], known: &Durations, workers: usize) -> Vec<T
     let mut tasks = Vec::new();
     for (path, _) in files {
         let Some(durations) = known.get(path) else {
-            tasks.push(Task { path: path.clone(), cuts: vec![], chunk: 0, estimate: None });
+            tasks.push(Task { path: path.clone(), cuts: vec![], chunk: 0, estimate: None, only: None, attempt: 0, from: 0 });
             continue;
         };
         let cuts = split(durations, share, workers);
@@ -38,7 +44,7 @@ pub fn plan(files: &[(String, u64)], known: &Durations, workers: usize) -> Vec<T
         bounds.push(durations.len());
         for chunk in 0..=cuts.len() {
             let estimate = durations[bounds[chunk]..bounds[chunk + 1]].iter().sum();
-            tasks.push(Task { path: path.clone(), cuts: cuts.clone(), chunk, estimate: Some(estimate) });
+            tasks.push(Task { path: path.clone(), cuts: cuts.clone(), chunk, estimate: Some(estimate), only: None, attempt: 0, from: 0 });
         }
     }
     let size: HashMap<&String, u64> = files.iter().map(|(f, s)| (f, *s)).collect();

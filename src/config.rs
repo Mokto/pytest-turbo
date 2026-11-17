@@ -113,15 +113,19 @@ fn globs(patterns: Vec<String>) -> Vec<GlobMatcher> {
 }
 
 /// Test files under `roots`, absolute, with their size in bytes. Explicit file arguments are
-/// kept as given, like pytest does.
+/// kept as given, like pytest does, and so is a node id (`file.py::Class::test`) after its file.
 pub fn discover(roots: &[PathBuf], cfg: &Config) -> Vec<(String, u64)> {
     let mut out = Vec::new();
     for root in roots {
-        let Ok(root) = root.canonicalize() else {
-            eprintln!("pytest-turbo: no such path: {}", root.display());
+        let given = root.to_string_lossy();
+        let (file, node) = given.split_once("::").map_or((root.clone(), None), |(f, n)| (PathBuf::from(f), Some(n)));
+        let Ok(root) = file.canonicalize() else {
+            eprintln!("pytest-turbo: no such path: {}", file.display());
             continue;
         };
-        if root.is_file() {
+        if let Some(node) = node {
+            out.push((format!("{}::{node}", root.display()), fs::metadata(&root).map_or(0, |m| m.len())));
+        } else if root.is_file() {
             push(&mut out, &root);
         } else {
             walk(&root, cfg, &mut out);
