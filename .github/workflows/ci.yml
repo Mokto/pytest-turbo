@@ -20,4 +20,4 @@ jobs:
       - run: cargo clippy --release -- -D warnings
       - run: cargo test --release
       - run: uv run --no-project --with pytest python selfcheck.py
-      - run: uv run --no-project --with pytest --with pytest-rerunfailures --with pytest-timeout python selfcheck.py  # both blocked in the workers
+      - run: uv run --no-project --python 3.11 --with pytest --with pytest-rerunfailures --with pytest-timeout --with snapshottest python selfcheck.py  # all blocked in the workers; snapshottest needs imp (< 3.12)

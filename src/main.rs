@@ -65,6 +65,19 @@ struct Worker {
     running: Option<(String, usize, u64, u64)>,
 }
 
+/// One snapshots/snap_<module>.py under --snapshot-update, as the workers report it.
+#[derive(Default)]
+struct SnapFile {
+    /// Task paths whose tests used it: unvisited entries go only when all of them ran in full.
+    paths: HashSet<String>,
+    /// Statement source by key, as the file has it.
+    entries: Option<BTreeMap<String, String>>,
+    visited: HashSet<String>,
+    updates: BTreeMap<String, String>,
+}
+
+const SNAPSHOT_HEADER: &str = "# Written by pytest-turbo --snapshot-update.\nsnapshots = {}\n";
+
 struct TestResult {
     outcome: String,
     duration: f64,
@@ -130,6 +143,9 @@ fn main() -> ExitCode {
     let mut retried: HashSet<(String, usize, Option<String>)> = HashSet::new();
     let mut reruns: HashMap<String, u64> = HashMap::new();
     let mut awaiting_rerun: HashSet<String> = HashSet::new();
+    let mut snapfiles: BTreeMap<String, SnapFile> = BTreeMap::new();
+    let mut partial: HashSet<String> = HashSet::new();
+    let mut failed_paths: HashSet<String> = HashSet::new();
     let mut failed = 0;
     let mut restarts = 0;
     let mut stopping = false;
@@ -174,6 +190,7 @@ fn main() -> ExitCode {
                         }
                         if matches!(r.outcome.as_str(), "failed" | "error") || r.subtests.contains_key("failed") {
                             failed += 1;
+                            failed_paths.insert(msg["path"].as_str().unwrap_or("").to_string());
                             say(format!("{} {nodeid} {}", style("FAIL").red().bold(), style(format!("{:.2}s", r.duration)).dim()));
                             if maxfail.is_some_and(|m| failed >= m) && !stopping {
                                 stopping = true;
@@ -217,6 +234,25 @@ fn main() -> ExitCode {
                                 alive += 1;
                             }
                         }
+                    }
+                    "snapfile" => {
+                        let sf = snapfiles.entry(msg["file"].as_str().unwrap_or("").to_string()).or_default();
+                        sf.paths.insert(msg["path"].as_str().unwrap_or("").to_string());
+                        if sf.entries.is_none() {
+                            sf.entries = serde_json::from_value(msg["entries"].clone()).ok();
+                        }
+                    }
+                    "snapshot" => {
+                        let sf = snapfiles.entry(msg["file"].as_str().unwrap_or("").to_string()).or_default();
+                        sf.paths.insert(msg["path"].as_str().unwrap_or("").to_string());
+                        let key = msg["key"].as_str().unwrap_or("").to_string();
+                        if let Some(entry) = msg["entry"].as_str() {
+                            sf.updates.insert(key.clone(), entry.to_string());
+                        }
+                        sf.visited.insert(key);
+                    }
+                    "partial" => {
+                        partial.insert(msg["path"].as_str().unwrap_or("").to_string());
                     }
                     "collect_error" => {
                         let path = msg["path"].as_str().unwrap_or("").to_string();
@@ -267,6 +303,7 @@ fn main() -> ExitCode {
                         continue;
                     }
                     say(format!("{} {nodeid} worker {wid} died", style("CRASH").red().bold()));
+                    failed_paths.insert(current.path.clone());
                     let r = TestResult {
                         outcome: "error".into(),
                         duration: 0.0,
@@ -312,12 +349,20 @@ fn main() -> ExitCode {
         errors.extend(awaiting_rerun.into_iter().map(|id| (format!("rerun never reported: {id}"), String::new())));
     }
 
+    let complete = |p: &String| {
+        !stopping && !p.contains("::") && !partial.contains(p) && !failed_paths.contains(p) && chunks_done.get(p) == chunks_per_file.get(p)
+    };
+    let snapshot_summary = write_snapshots(snapfiles, complete, &mut errors);
+
     let measured: Durations = durations.into_iter().filter(|(path, _)| chunks_done.get(path) == chunks_per_file.get(path)).collect();
     save_durations(&durations_file, &cfg.rootdir, &measured);
     let mut cache = known;
     cache.extend(measured);
 
     report(&results, &errors, &files, &cache, start, discovery, n, &cwd);
+    if let Some(s) = snapshot_summary {
+        println!("{}", style(s).dim());
+    }
     let ok = errors.is_empty() && failed == 0;
     ExitCode::from(if results.is_empty() && ok { 5 } else if ok { 0 } else { 1 })
 }
@@ -352,6 +397,44 @@ fn spawn(python: &Path, pytest_args: &[String], logs: &Path, wid: usize, n: usiz
     });
     let stdin = child.stdin.take().unwrap();
     Worker { child, stdin, inflight: vec![], exited: false, closed: false, running: None }
+}
+
+/// Writes each snapshot file once, after every worker is done: entries kept as they were, updated
+/// ones replaced, and unvisited ones removed when every test that uses the file ran (snapshottest
+/// removed them per worker, which is why it could not split a file).
+fn write_snapshots(files: BTreeMap<String, SnapFile>, complete: impl Fn(&String) -> bool, errors: &mut Vec<(String, String)>) -> Option<String> {
+    if files.is_empty() {
+        return None;
+    }
+    let (mut written, mut removed, mut changed) = (0, 0, 0);
+    for (file, sf) in files {
+        let mut entries = sf.entries.unwrap_or_default();
+        written += sf.updates.len();
+        entries.extend(sf.updates);
+        if sf.paths.iter().all(&complete) {
+            let before = entries.len();
+            entries.retain(|k, _| sf.visited.contains(k));
+            removed += before - entries.len();
+        }
+        let path = Path::new(&file);
+        let old = fs::read_to_string(path).ok();
+        let result = if entries.is_empty() {
+            old.map_or(Ok(false), |_| fs::remove_file(path).map(|_| true))
+        } else {
+            let text = SNAPSHOT_HEADER.to_string() + &entries.values().map(|s| format!("\n{s}\n")).collect::<String>();
+            if old.as_deref() == Some(text.as_str()) {
+                Ok(false)
+            } else {
+                path.parent().map_or(Ok(()), fs::create_dir_all).and_then(|_| fs::write(path, text)).map(|_| true)
+            }
+        };
+        match result {
+            Ok(true) => changed += 1,
+            Ok(false) => {}
+            Err(e) => errors.push((format!("could not write {file}"), e.to_string())),
+        }
+    }
+    Some(format!("snapshots: {written} written, {removed} removed, {changed} files changed"))
 }
 
 fn log_path(logs: &Path, wid: usize) -> PathBuf {

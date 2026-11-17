@@ -216,3 +216,66 @@ with tempfile.TemporaryDirectory() as tmp:
     assert node.returncode == 0 and counts(last_line(node.stdout)) == {"passed": 1}, node.stdout
     assert "visible with -s" in node.stdout + node.stderr, node.stdout + node.stderr
     print("node id and -s: ok")
+
+# Snapshots: snapshottest's keys and files, written once by the controller even when the file is split.
+with tempfile.TemporaryDirectory() as tmp:
+    Path(tmp, "test_snap.py").write_text(
+        "import os, pytest\n\n"
+        "class TestA:\n"
+        "    @pytest.fixture(scope='class', autouse=True)\n"
+        "    def snap(self, request):\n"
+        "        request.cls.snap = request.config.pluginmanager.get_plugin('pytest_turbo').snapshot(request)\n\n"
+        "    def test_one(self):\n        self.snap.assert_match('one\\nline \"quoted\"', 'first')\n\n"
+        "    def test_two(self):\n        self.snap.assert_match(b'bytes', 'second')\n\n"
+        "def test_f1(snapshot):\n    snapshot.assert_match({'a': 1})\n\n"
+        "def test_f2(snapshot):\n    snapshot.assert_match('x')\n    snapshot.assert_match('y')\n\n"
+        "def test_f3(snapshot):\n    snapshot.assert_match(os.environ.get('SNAPVAL', 'v1'), 'env')\n\n"
+        "def test_f4():\n    pass\n"
+    )
+    durations = Path(tmp, "durations.json")
+    snap = Path(tmp, "snapshots", "snap_test_snap.py")
+
+    def run(*pytest_args, val="v1", paths=()):
+        durations.write_text(json.dumps({"test_snap.py": [1.0] * 6}))  # slow enough to split in 3
+        cmd = [TURBO, "-n", "3", "--python", sys.executable, "--durations-file", str(durations), *paths, "--", *pytest_args]
+        return subprocess.run(cmd, cwd=tmp, capture_output=True, text=True, env={**os.environ, "NO_COLOR": "1", "SNAPVAL": val})
+
+    def result_line(out):
+        return [l for l in out.splitlines() if "workers, discovery" in l][-1]
+
+    def keys():
+        return sorted(re.findall(r'^snapshots\[\s*"([^"]+)"', snap.read_text(), re.M))
+
+    missing = run()
+    assert counts(result_line(missing.stdout)) == {"failed": 5, "passed": 1}, missing.stdout
+    assert "no snapshot 'test_f1 1'" in missing.stdout and not snap.exists(), missing.stdout
+    written = run("--snapshot-update")
+    assert written.returncode == 0 and "3 workers" in result_line(written.stdout), written.stdout
+    assert "snapshots: 6 written, 0 removed, 1 files changed" in written.stdout, written.stdout
+    want = ["TestA.TestA first", "TestA.TestA second", "test_f1 1", "test_f2 1", "test_f2 2", "test_f3 env"]
+    assert keys() == want and snap.read_text().startswith("# Written by pytest-turbo"), snap.read_text()
+    again = run("--snapshot-update")
+    assert "0 written, 0 removed, 0 files changed" in again.stdout, again.stdout
+    assert run().returncode == 0
+    print("snapshots written across split workers: ok")
+
+    snap.write_text(snap.read_text() + '\nsnapshots["gone 1"] = "stale"\n')
+    partial = run("--snapshot-update", "-k", "not f1", val="v2")
+    assert keys() == sorted(want + ["gone 1"]) and "'v2'" not in snap.read_text() and '"v2"' in snap.read_text(), snap.read_text()
+    node = run("--snapshot-update", paths=["test_snap.py::test_f2"])
+    assert node.returncode == 0 and "gone 1" in keys(), node.stdout
+    full = run("--snapshot-update", val="v2")
+    assert keys() == want and "1 removed" in full.stdout, full.stdout
+    print("unvisited snapshots kept on partial runs, removed on full ones: ok")
+
+    differ = run(val="v3")
+    assert counts(result_line(differ.stdout)) == {"failed": 1, "passed": 5}, differ.stdout
+    assert "snapshot 'test_f3 env' does not match" in differ.stdout and "-v2" in differ.stdout and "+v3" in differ.stdout, differ.stdout
+    old = snap.read_text().replace(
+        "# Written by pytest-turbo --snapshot-update.\nsnapshots = {}\n",
+        "# -*- coding: utf-8 -*-\n# snapshottest: v1 - https://goo.gl/zC4yUc\nfrom __future__ import unicode_literals\n\n"
+        "from snapshottest import Snapshot\n\nsnapshots = Snapshot()\n",
+    )
+    snap.write_text(old)
+    assert run(val="v2").returncode == 0, "reads snapshottest's own files"
+    print("snapshot diff and snapshottest files: ok")

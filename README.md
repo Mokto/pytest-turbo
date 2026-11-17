@@ -38,6 +38,21 @@ timeout = 120
 - `--timeout SECONDS`, the `timeout` ini key or `@pytest.mark.timeout(seconds)` fail a test that runs too long, with a traceback where it was stuck. If the test can't be interrupted (a C call that never returns), the worker prints every thread's stack and exits 10 seconds later; the test is reported with that output and the rest of its file goes on.
 - pytest-rerunfailures and pytest-timeout are disabled in the workers if installed, and plain `pytest` rejects these options once they are uninstalled.
 
+### Snapshots
+
+pytest-turbo replaces snapshottest, with its keys and its files (`snapshots/snap_<module>.py` beside each test module), so existing snapshots keep working:
+
+```python
+def test_render(snapshot):
+    snapshot.assert_match(render(), "page")
+```
+
+- Without `--snapshot-update`, a missing snapshot fails, and a different one fails with a unified diff.
+- With `--snapshot-update`, workers send what they saw and the controller writes each file once, at the end. A file split across workers is updated in full, so updating snapshots needs no `--no-split`. Entries no test used are removed only when every test of the module ran and passed (not with `-k`, a test id, `-x` or a failure).
+- Written entries are formatted as ruff formats them; unchanged entries keep their text.
+- For a class-scoped fixture, `request.config.pluginmanager.get_plugin("pytest_turbo").snapshot(request)` returns the same object, keyed by the class as snapshottest keys it.
+- snapshottest is disabled in the workers if installed. Its `from snapshottest import Snapshot` header is still read; files are written with `snapshots = {}` instead.
+
 ### In CI
 
 The speedup depends on knowing test durations from earlier runs. On a fresh checkout there are none, so keep the file somewhere that survives between jobs:
@@ -80,6 +95,7 @@ A Rust binary finds the test files, plans the order and runs one long-lived pyte
 - `collect_ignore` and `collect_ignore_glob` in a `conftest.py` are not applied; `--ignore` and `--ignore-glob` after `--` are.
 - No JUnit XML output yet.
 - Coverage (pytest-cov) is not combined across workers.
+- Snapshot values are strings, bytes and other Python literals; snapshottest's `FileSnapshot` and `GenericRepr` are not supported.
 - Not supported from pytest-rerunfailures and pytest-timeout: `--reruns-delay`, `--rerun-except`, `@pytest.mark.flaky`, `timeout_method` and `timeout_func_only`.
 - Not tested on Windows.
 

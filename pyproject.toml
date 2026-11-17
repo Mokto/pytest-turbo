@@ -9,6 +9,7 @@ description = "Run your pytest suite in parallel, slowest tests first, in long-l
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.9"
+dependencies = ["pytest>=8"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Framework :: Pytest",

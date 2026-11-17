@@ -8,12 +8,18 @@ Reruns and timeouts replace pytest-rerunfailures and pytest-timeout, with the sa
 `--reruns`, `--only-rerun`, `--timeout`, the `timeout` ini key and `@pytest.mark.timeout`.
 A failed attempt is reported with outcome "rerun", as pytest-rerunfailures does, and the
 controller runs it again as its own task.
+
+Snapshots replace snapshottest, with its keys and its snapshots/snap_<module>.py files. Workers
+compare; with --snapshot-update they send entries to the controller, which writes each file once.
 """
 
+import ast
 import bisect
+import difflib
 import faulthandler
 import json
 import os
+import pprint
 import re
 import signal
 import sys
@@ -22,6 +28,72 @@ from collections import Counter
 import pytest
 
 HARD_TIMEOUT_GRACE = 10
+SNAPSHOT_LINE = 88  # ruff's default line length: written entries come out already formatted
+
+
+class Snapshot:
+    """`snapshot.assert_match(value, name="")`, keyed as snapshottest keys it."""
+
+    def __init__(self, plugin, request):
+        node = request.node
+        self.plugin = plugin
+        self.file = str(node.path.parent / "snapshots" / f"snap_{node.path.stem}.py")
+        cls = getattr(node.cls, "__name__", "")
+        self.prefix = (f"{cls}." if cls else "") + re.sub(r"\s+", " ", node.name.replace(r"\n", " "))
+        self.counter = 1
+
+    def assert_match(self, value, name=""):
+        __tracebackhide__ = True
+        key = f"{self.prefix} {name or self.counter}"
+        if not name:
+            self.counter += 1
+        self.plugin.match_snapshot(self.file, key, value)
+
+
+def read_snapshots(file):
+    """{key: (value, source of its statement)} from a snapshot file, without importing it."""
+    try:
+        with open(file, encoding="utf-8") as f:
+            src = f.read()
+    except FileNotFoundError:
+        return {}
+    entries = {}
+    for node in ast.parse(src).body:
+        target = node.targets[0] if isinstance(node, ast.Assign) and len(node.targets) == 1 else None
+        if isinstance(target, ast.Subscript) and isinstance(target.value, ast.Name) and target.value.id == "snapshots":
+            entries[ast.literal_eval(target.slice)] = (ast.literal_eval(node.value), ast.get_source_segment(src, node))
+    return entries
+
+
+def snapshot_literal(value):
+    if isinstance(value, str) and "\n" in value:
+        s = value.replace("\\", "\\\\").replace("\r", "\\r").replace('"""', '\\"\\"\\"')
+        return '"""' + (s[:-1] + '\\"' if s.endswith('"') else s) + '"""'
+    if isinstance(value, (str, bytes)):
+        b = "b" if isinstance(value, bytes) else ""
+        r = repr(value)[len(b):]
+        if r[0] == "'" and '"' not in r:
+            r = '"' + r[1:-1].replace("\\'", "'") + '"'
+        return b + r
+    return repr(value)
+
+
+def snapshot_statement(key, value):
+    """The entry as ruff formats it, so a written file passes `ruff format --check`."""
+    k, v = snapshot_literal(key), snapshot_literal(value)
+    flat = f"snapshots[{k}] = {v}"
+    if len(flat.split("\n")[0]) <= SNAPSHOT_LINE:
+        return flat
+    if "\n" not in v and len(f"snapshots[{k}] = (") <= SNAPSHOT_LINE:
+        return f"snapshots[{k}] = (\n    {v}\n)"
+    return f"snapshots[\n    {k}\n] = {v}"
+
+
+def snapshot_diff(key, expected, actual):
+    if not (isinstance(expected, str) and isinstance(actual, str)):
+        expected, actual = pprint.pformat(expected), pprint.pformat(actual)
+    diff = difflib.unified_diff(expected.splitlines(), actual.splitlines(), "snapshot", "actual", lineterm="")
+    return f"snapshot {key!r} does not match (--snapshot-update accepts the new value):\n" + "\n".join(diff)
 
 
 class TurboWorker:
@@ -31,6 +103,10 @@ class TurboWorker:
         self.where = {}
         self.results = {}
         self.stderr = os.fdopen(os.dup(2), "w")  # pytest's fd capture swaps fd 2 while a test runs
+        self.__name__ = "pytest_turbo"  # the name pluggy registers it under: get_plugin("pytest_turbo")
+        self.snapshot_files = {}
+        self.task_path = None
+        self.collecting = None
 
     def send(self, **msg):
         self.events.write(json.dumps(msg) + "\n")
@@ -43,11 +119,13 @@ class TurboWorker:
             if not line:
                 return None
             path, cuts, chunk, only, attempt, start = line.split("\t")
+            self.collecting = path
             try:
                 items = list(session.perform_collect([path]))
             except Exception as exc:  # usage errors and the like, outside pytest's own reporting
                 self.send(type="collect_error", path=path, error=repr(exc))
                 items = []
+            self.collecting = None
             bounds = [0, *(min(int(c), len(items)) for c in cuts.split(",") if c), len(items)]
             mine, owner = [], {}
             for i, item in enumerate(items):
@@ -76,15 +154,45 @@ class TurboWorker:
         group.addoption("--only-rerun", action="append", default=[], help="Rerun only failures matching this regex")
         group.addoption("--timeout", type=float, default=None, help="Fail a test after this many seconds")
         parser.addini("timeout", "Fail a test after this many seconds", default=None)
+        group.addoption("--snapshot-update", action="store_true", help="Write snapshots instead of comparing them")
 
     def pytest_configure(self, config):
         self.rootpath = config.rootpath
+        self.snapshot_update = config.getoption("snapshot_update")
         self.reruns = config.getoption("reruns")
         self.only_rerun = [re.compile(p) for p in config.getoption("only_rerun")]
         timeout = config.getoption("timeout")
         self.timeout = float(timeout if timeout is not None else config.getini("timeout") or 0)
         config.addinivalue_line("markers", "timeout(seconds): fail the test after this many seconds")
         signal.signal(signal.SIGALRM, self.on_timeout)
+
+    def snapshot(self, request):
+        """A Snapshot for the requesting node: what the `snapshot` fixture returns, for class-scoped fixtures too."""
+        return Snapshot(self, request)
+
+    @pytest.fixture(name="snapshot")
+    def snapshot_fixture(self, request):
+        return Snapshot(self, request)
+
+    def match_snapshot(self, file, key, value):
+        __tracebackhide__ = True
+        entries = self.snapshot_files.get(file)
+        if entries is None:
+            entries = self.snapshot_files[file] = read_snapshots(file)
+            if self.snapshot_update:
+                self.send(type="snapfile", file=file, path=self.task_path, entries={k: src for k, (_, src) in entries.items()})
+        old = entries.get(key)
+        if self.snapshot_update:
+            same = old is not None and type(old[0]) is type(value) and old[0] == value
+            self.send(type="snapshot", file=file, path=self.task_path, key=key, entry=None if same else snapshot_statement(key, value))
+        elif old is None:
+            raise AssertionError(f"no snapshot {key!r} in {os.path.relpath(file)} (--snapshot-update writes it)")
+        elif old[0] != value:
+            raise AssertionError(snapshot_diff(key, old[0], value))
+
+    def pytest_deselected(self, items):
+        if self.collecting and self.snapshot_update:  # -k/-m: the file's unvisited snapshots may belong to deselected tests
+            self.send(type="partial", path=self.collecting)
 
     def on_timeout(self, signum, frame):
         pytest.fail(f"Timeout (>{self.current_timeout}s) from pytest-turbo.")
@@ -142,6 +250,7 @@ class TurboWorker:
         current = self.next_task(session)
         while current:
             task, items = current
+            self.task_path = task[0]
             # Collect the next task before the last item's teardown, so fixtures it
             # shares with the next item (session scope) stay up.
             upcoming = None
@@ -209,8 +318,9 @@ def main():
     os.dup2(2 if os.environ.pop("PYTEST_TURBO_OUTPUT", None) else os.open(os.devnull, os.O_WRONLY), 1)
     os.dup2(os.open(os.devnull, os.O_RDONLY), 0)
     plugin = TurboWorker(events, inbox)
-    # pytest-rerunfailures and pytest-timeout would rerun and time out a second time, and clash with the options above.
-    code = pytest.main(["-p", "no:cacheprovider", "-p", "no:rerunfailures", "-p", "no:timeout", *sys.argv[1:]], plugins=[plugin])
+    # pytest-rerunfailures, pytest-timeout and snapshottest clash with the options and fixture above.
+    blocked = ["-p", "no:rerunfailures", "-p", "no:timeout", "-p", "no:snapshottest"]
+    code = pytest.main(["-p", "no:cacheprovider", *blocked, *sys.argv[1:]], plugins=[plugin])
     plugin.send(type="exit", code=int(code))
 
 
