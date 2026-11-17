@@ -44,7 +44,7 @@ struct Args {
     /// Python interpreter (default: $VIRTUAL_ENV, the nearest .venv, the env this binary is installed in, python3)
     #[arg(long)]
     python: Option<PathBuf>,
-    /// Start every worker on its own, instead of forking them from one process that has imported what the last run's workers imported
+    /// Start every worker on its own, instead of forking them from one process that has imported what the last run's workers imported (always on macOS)
     #[arg(long)]
     no_preload: bool,
     /// Files or directories (default: testpaths from the pytest config, else ".")
@@ -182,8 +182,10 @@ fn main() -> ExitCode {
     let (tx, rx) = mpsc::channel();
     let preload_file = durations_file.with_extension("modules.json");
     let preload_key = cwd.strip_prefix(&cfg.rootdir).map_or(cwd.display().to_string(), |p| p.display().to_string());
+    // macOS system frameworks aren't fork-safe: a forked worker hangs in urllib's proxy lookup (httpx calls it for every client).
+    let preload = !args.no_preload && !cfg!(target_os = "macos");
     let mut zygote = None;
-    if !args.no_preload {
+    if preload {
         let saved = read_json(&preload_file).get(&preload_key).cloned().unwrap_or(Value::Null);
         zygote = start_zygote(&python, &args.pytest_args, &logs, n, show_output, &saved, &tx);
     }
@@ -194,7 +196,7 @@ fn main() -> ExitCode {
         if zygote.as_mut().is_some_and(|z| z.send(json!({"fork": wid, "log": log}))) {
             workers.push(Worker::new(Proc::Forked(None), None));
         } else {
-            workers.push(spawn(&python, &args.pytest_args, &logs, wid, n, show_output, !args.no_preload, &tx));
+            workers.push(spawn(&python, &args.pytest_args, &logs, wid, n, show_output, preload, &tx));
         }
     };
     for _ in 0..n {
@@ -454,7 +456,7 @@ fn main() -> ExitCode {
         let _ = child.wait();
         let _ = fs::remove_file(&socket);
     }
-    if !args.no_preload && !stopping && !imported.is_empty() {
+    if preload && !stopping && !imported.is_empty() {
         update_json(&preload_file, |saved| {
             saved.insert(preload_key, json!({"modules": imported}));
         });

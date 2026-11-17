@@ -32,8 +32,10 @@ import signal
 import socket
 import sys
 from collections import Counter
+from pathlib import Path
 
 import pytest
+from _pytest.runner import collect_one_node
 
 HARD_TIMEOUT_GRACE = 10
 SNAPSHOT_LINE = 88  # ruff's default line length: written entries come out already formatted
@@ -113,8 +115,53 @@ class TurboWorker:
         self.stderr = os.fdopen(os.dup(2), "w")  # pytest's fd capture swaps fd 2 while a test runs
         self.__name__ = "pytest_turbo"  # the name pluggy registers it under: get_plugin("pytest_turbo")
         self.snapshot_files = {}
+        self.path_cache = {}  # the session's first level, as Session.collect keeps it within one collection
+        self.dir_reports = {}  # directory node -> its collect report, kept for the whole run
         self.task_path = None
         self.collecting = None
+
+    def collect_file(self, session, path):
+        """session.perform_collect([path]), keeping directory nodes between tasks.
+
+        perform_collect starts from scratch on each call: every directory from the rootdir down is
+        listed again and its nodes rebuilt, which costs more than many test files take to run.
+        """
+        arg = Path(os.path.abspath(session.config.invocation_params.dir / path))
+        module = "::" not in path and arg.is_file() and self.find_module(session, arg)
+        if not module:
+            return list(session.perform_collect([path]))
+        session._initialpaths = frozenset([arg])
+        session._initialpaths_with_parents = frozenset([arg, *arg.parents])
+        session._collection_cache = {}  # so genitems collects the module again, with fresh items
+        session.items = items = list(session.genitems(module))
+        try:
+            session.config.hook.pytest_collection_modifyitems(session=session, config=session.config, items=items)
+        finally:
+            session.config.hook.pytest_collection_finish(session=session)
+        session.testscollected = len(items)
+        return items
+
+    def find_module(self, session, arg):
+        """The collector for a test file, through cached directory nodes; None when it isn't one of them."""
+        parts = [arg]
+        for parent in arg.parents:
+            if not session.config.pluginmanager._is_in_confcutdir(parent):
+                break
+            parts.insert(0, parent)
+        nodes = session._collect_path(parts[0], self.path_cache)
+        for i, part in enumerate(parts):
+            node = next((n for n in nodes if n.path == part), None)
+            if node is None or i == len(parts) - 1:
+                return node
+            rep = self.dir_reports.get(node)
+            if rep is None:
+                rep = self.dir_reports[node] = collect_one_node(node)
+                if not rep.passed:
+                    node.ihook.pytest_collectreport(report=rep)
+            if not rep.passed:
+                return None
+            nodes = rep.result
+        return None
 
     def send(self, **msg):
         self.events.write(json.dumps(msg) + "\n")
@@ -129,7 +176,7 @@ class TurboWorker:
             path, cuts, chunk, only, attempt, start = line.split("\t")
             self.collecting = path
             try:
-                items = list(session.perform_collect([path]))
+                items = self.collect_file(session, path)
             except Exception as exc:  # usage errors and the like, outside pytest's own reporting
                 self.send(type="collect_error", path=path, error=repr(exc))
                 items = []

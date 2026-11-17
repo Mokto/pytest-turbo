@@ -86,6 +86,7 @@ Every worker imports the same packages and the code under test, often most of wh
 - Modules that resolve to another file without the test directories pytest adds to `sys.path`, such as test helpers or the many packages named `tests`, are left to the workers, as are modules that fail to import.
 - Threads that the imported code starts don't exist in the forked workers. If a suite behaves differently than with `--no-preload`, this is the first suspect.
 - If the process the workers are forked from dies, the run goes on with workers started the usual way.
+- Off on macOS: its system frameworks aren't safe to use after a fork, and forked workers hang in calls such as `urllib.request.getproxies()`, which httpx makes for every client.
 - The list only grows, since the workers report what was preloaded too. Delete the file to start over.
 
 ## Output

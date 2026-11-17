@@ -154,28 +154,31 @@ with tempfile.TemporaryDirectory() as tmp:
         os.remove(Path(tmp, "groups.txt"))
         assert "assert 3 == 4" in turbo.stdout, turbo.stdout
         print(f"-n {workers} {' '.join(preload)}: ok {got}")
-    # On their own: a worker that test_crash.py kills never reports what it imported. The workers import
-    # a/tests as "tests" from the directory pytest adds to sys.path; without it, "tests" is another package.
-    modules = Path(tmp, ".pytest-turbo/durations.modules.json")
-    for _ in range(2):
-        Path(tmp, "preloaded.txt").unlink(missing_ok=True)
-        turbo = subprocess.run(
-            [TURBO, "-n", "1", "--python", sys.executable, "test_preload.py", "a/tests/test_a.py"], cwd=tmp, capture_output=True, text=True, env=env
-        )
-        assert counts(last_line(turbo.stdout)) == {"passed": 3, "failed": 1}, turbo.stdout
-    assert Path(tmp, "preloaded.txt").read_text() == "True\n", "helper.py was not imported before the worker forked"
-    saved = json.loads(Path(tmp, ".pytest-turbo/durations.modules.json").read_text())[""]
-    names = {name for name, _ in saved["modules"]}
-    assert "helper" in names and not {"conftest", "test_preload", "pkg.case_test"} & names, names
-    print("preload: ok")
-    Path(tmp, "exits.py").write_text("import os\n\nos._exit(3)\n")
-    saved = json.loads(modules.read_text())
-    saved[""]["modules"].append(["exits", str(Path(tmp, "exits.py").resolve())])
-    modules.write_text(json.dumps(saved))
-    turbo = subprocess.run([TURBO, "-n", "2", "--python", sys.executable, "test_preload.py"], cwd=tmp, capture_output=True, text=True, env=env, timeout=60)
-    assert "the process the workers are forked from died" in turbo.stdout + turbo.stderr and counts(last_line(turbo.stdout)) == {"passed": 2, "failed": 1}, turbo.stdout + turbo.stderr
-    Path(tmp, "exits.py").unlink()
-    print("preload, its process dies: ok")
+    if sys.platform == "darwin":  # pytest-turbo does not preload on macOS
+        print("preload: skipped on macOS")
+    else:
+        # On their own: a worker that test_crash.py kills never reports what it imported. The workers import
+        # a/tests as "tests" from the directory pytest adds to sys.path; without it, "tests" is another package.
+        modules = Path(tmp, ".pytest-turbo/durations.modules.json")
+        for _ in range(2):
+            Path(tmp, "preloaded.txt").unlink(missing_ok=True)
+            turbo = subprocess.run(
+                [TURBO, "-n", "1", "--python", sys.executable, "test_preload.py", "a/tests/test_a.py"], cwd=tmp, capture_output=True, text=True, env=env
+            )
+            assert counts(last_line(turbo.stdout)) == {"passed": 3, "failed": 1}, turbo.stdout
+        assert Path(tmp, "preloaded.txt").read_text() == "True\n", "helper.py was not imported before the worker forked"
+        saved = json.loads(Path(tmp, ".pytest-turbo/durations.modules.json").read_text())[""]
+        names = {name for name, _ in saved["modules"]}
+        assert "helper" in names and not {"conftest", "test_preload", "pkg.case_test"} & names, names
+        print("preload: ok")
+        Path(tmp, "exits.py").write_text("import os\n\nos._exit(3)\n")
+        saved = json.loads(modules.read_text())
+        saved[""]["modules"].append(["exits", str(Path(tmp, "exits.py").resolve())])
+        modules.write_text(json.dumps(saved))
+        turbo = subprocess.run([TURBO, "-n", "2", "--python", sys.executable, "test_preload.py"], cwd=tmp, capture_output=True, text=True, env=env, timeout=60)
+        assert "the process the workers are forked from died" in turbo.stdout + turbo.stderr and counts(last_line(turbo.stdout)) == {"passed": 2, "failed": 1}, turbo.stdout + turbo.stderr
+        Path(tmp, "exits.py").unlink()
+        print("preload, its process dies: ok")
 
     cache = json.loads(Path(tmp, ".pytest-turbo/durations.json").read_text())
     assert len(cache["test_big.py"]) == 40, "split chunks did not report every test of the split file"
